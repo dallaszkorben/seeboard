@@ -33,6 +33,8 @@ bool gps_has_fix = false;
 unsigned long last_display_update = 0;
 const unsigned long DISPLAY_UPDATE_INTERVAL = 500;
 unsigned long gps_wait_start = 0;
+unsigned long last_wifi_attempt = 0;
+const unsigned long WIFI_RETRY_INTERVAL = 30000;  // Retry every 30 seconds
 
 // ===== GPS DATA CACHE =====
 float cached_lat = 0;
@@ -46,6 +48,8 @@ String cached_time = "";
 void initOLED();
 void initGPS();
 void initWiFi();
+void setupWiFiServer();
+void attemptWiFiReconnect();
 void handleGPS();
 void readGPSData();
 void updateDisplay();
@@ -120,25 +124,53 @@ void initWiFi() {
   }
   
   if (WiFi.status() == WL_CONNECTED) {
-    wifi_connected = true;
-    Serial.println("\n✓ WiFi connected!");
-    Serial.print("IP Address: ");
-    Serial.println(WiFi.localIP());
-    
-    if (!MDNS.begin("esp8266-gps")) {
-      Serial.println("ERROR: mDNS setup failed");
-    } else {
-      MDNS.addService("gps", "tcp", 80);
-      Serial.println("✓ mDNS started: esp8266-gps.local");
-    }
-    
-    server.on("/gps", handleGPS);
-    server.begin();
-    Serial.println("✓ HTTP server started on port 80");
+    setupWiFiServer();
   } else {
     wifi_connected = false;
-    Serial.println("\n✗ WiFi connection failed - Standalone mode");
-    WiFi.mode(WIFI_OFF);
+    Serial.println("\n✗ WiFi connection failed - Will retry every 30 seconds");
+    Serial.println("  Standalone mode active (GPS display works)");
+  }
+}
+
+// ===== SETUP WIFI SERVER (mDNS + HTTP) =====
+void setupWiFiServer() {
+  wifi_connected = true;
+  Serial.println("\n✓ WiFi connected!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+  
+  if (!MDNS.begin("esp8266-gps")) {
+    Serial.println("ERROR: mDNS setup failed");
+  } else {
+    MDNS.addService("gps", "tcp", 80);
+    Serial.println("✓ mDNS started: esp8266-gps.local");
+  }
+  
+  server.on("/gps", handleGPS);
+  server.begin();
+  Serial.println("✓ HTTP server started on port 80");
+}
+
+// ===== ATTEMPT WIFI RECONNECTION (CALLED FROM LOOP) =====
+void attemptWiFiReconnect() {
+  unsigned long now = millis();
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    // WiFi is connected
+    if (!wifi_connected) {
+      // Was previously disconnected, now reconnected - setup server
+      setupWiFiServer();
+    }
+  } else {
+    // WiFi is disconnected
+    wifi_connected = false;
+    
+    // Attempt reconnection every 30 seconds
+    if (now - last_wifi_attempt >= WIFI_RETRY_INTERVAL) {
+      last_wifi_attempt = now;
+      Serial.println("\nRetrying WiFi connection...");
+      WiFi.reconnect();
+    }
   }
 }
 
@@ -154,15 +186,13 @@ void loop() {
     last_display_update = now;
   }
   
-  // Handle WiFi
+  // Attempt WiFi reconnection (with 30-second retry interval)
+  attemptWiFiReconnect();
+  
+  // Handle WiFi server if connected
   if (wifi_connected) {
     server.handleClient();
     MDNS.update();
-    
-    if (WiFi.status() != WL_CONNECTED) {
-      wifi_connected = false;
-      WiFi.reconnect();
-    }
   }
   
   delay(10);
@@ -275,32 +305,45 @@ void displayWaitingForFix() {
 // ===== DISPLAY: GPS FIX ACQUIRED =====
 void displayGPSFix() {
   display.clearDisplay();
-  display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
+  
+  // Coordinates in yellow area (top 16 pixels)
+  // Yellow area: pixels 0-15, Blue area starts at pixel 16
+  display.setTextSize(1);
+  
   display.setCursor(0, 0);
+  display.print("Lat:");
+  display.println(String(cached_lat, 6));
   
-  display.println("GPS FIX OK!");
-  display.println("");
+  // Position Lng at pixel 8 to fit completely in yellow area
+  display.setCursor(0, 8);
+  display.print("Long:");
+  display.println(String(cached_lng, 6));
   
-  display.print("Lat: ");
-  display.println(String(cached_lat, 4));
-  display.print("Lng: ");
-  display.println(String(cached_lng, 4));
-  
+  // Small info in blue area
+  display.setCursor(0, 20);
   display.print("Sats: ");
   display.print(cached_sats);
-  display.print(" | HDOP: ");
+  display.print("  HDOP: ");
   display.println(String(cached_hdop, 1));
   
-  // Show date and time
+  // Date and time
+  display.setCursor(0, 30);
   if (!cached_date.isEmpty()) {
-    display.print("Date: ");
-    display.println(cached_date);
+    display.print(cached_date);
+    if (!cached_time.isEmpty()) {
+      display.print("  ");
+      display.print(cached_time);
+    }
+  } else if (!cached_time.isEmpty()) {
+    display.print(cached_time);
   }
-  if (!cached_time.isEmpty()) {
-    display.print("Time: ");
-    display.println(cached_time);
-  }
+  display.println("");
+  
+  // WiFi status moved up (was at 58, now at 48 to stay visible)
+  display.setCursor(0, 48);
+  display.print("WiFi: ");
+  display.println(wifi_connected ? "OK" : "Offline");
   
   display.display();
   

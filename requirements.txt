@@ -1,5 +1,7 @@
+requests
 pyserial
 pynmea2
 tkintermapview
 gpsdclient
 zeroconf
+pillow

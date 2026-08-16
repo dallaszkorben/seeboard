@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP8266 GPS Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+
+        .container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            padding: 40px;
+            max-width: 600px;
+            width: 100%;
+        }
+
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+            text-align: center;
+            font-size: 2em;
+        }
+
+        .subtitle {
+            color: #666;
+            text-align: center;
+            margin-bottom: 30px;
+            font-size: 0.9em;
+        }
+
+        .status-indicator {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            margin-right: 8px;
+            vertical-align: middle;
+        }
+
+        .status-indicator.online {
+            background-color: #4CAF50;
+            animation: pulse-online 2s infinite;
+        }
+
+        .status-indicator.offline {
+            background-color: #f44336;
+        }
+
+        @keyframes pulse-online {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .data-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .data-item {
+            background: #f5f5f5;
+            padding: 20px;
+            border-radius: 10px;
+            border-left: 4px solid #667eea;
+        }
+
+        .data-label {
+            color: #999;
+            font-size: 0.85em;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 8px;
+        }
+
+        .data-value {
+            color: #333;
+            font-size: 1.5em;
+            font-weight: bold;
+            word-break: break-all;
+        }
+
+        .data-value.large {
+            font-size: 1.8em;
+        }
+
+        .full-width {
+            grid-column: 1 / -1;
+        }
+
+        .controls {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            justify-content: center;
+        }
+
+        button {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 0.9em;
+            transition: background 0.3s;
+        }
+
+        button:hover {
+            background: #5568d3;
+        }
+
+        button.refresh-active {
+            background: #4CAF50;
+        }
+
+        .refresh-interval {
+            color: #999;
+            text-align: center;
+            font-size: 0.85em;
+            margin-top: 10px;
+        }
+
+        .error-message {
+            background: #ffebee;
+            color: #c62828;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+            display: none;
+        }
+
+        .error-message.show {
+            display: block;
+        }
+
+        .map-link {
+            display: block;
+            text-align: center;
+            margin-top: 20px;
+            padding-top: 20px;
+            border-top: 1px solid #eee;
+        }
+
+        .map-link a {
+            color: #667eea;
+            text-decoration: none;
+            font-size: 0.9em;
+        }
+
+        .map-link a:hover {
+            text-decoration: underline;
+        }
+
+        .quality-indicator {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .quality-bar {
+            flex: 1;
+            height: 6px;
+            background: #eee;
+            border-radius: 3px;
+            overflow: hidden;
+        }
+
+        .quality-fill {
+            height: 100%;
+            background: #4CAF50;
+            transition: width 0.3s;
+        }
+
+        .quality-text {
+            font-size: 0.85em;
+            color: #999;
+        }
+
+        @media (max-width: 600px) {
+            .container {
+                padding: 20px;
+            }
+
+            h1 {
+                font-size: 1.5em;
+            }
+
+            .data-grid {
+                grid-template-columns: 1fr;
+                gap: 15px;
+            }
+
+            .controls {
+                flex-wrap: wrap;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🛰️ ESP8266 GPS</h1>
+        <p class="subtitle">
+            <span class="status-indicator online"></span>
+            <span id="status-text">Connecting...</span>
+        </p>
+
+        <div class="error-message" id="error-message"></div>
+
+        <div class="controls">
+            <button onclick="fetchGPS()">🔄 Refresh Now</button>
+            <button onclick="toggleAutoRefresh()" id="auto-refresh-btn">Auto: OFF</button>
+            <select id="interval-select" onchange="changeInterval()">
+                <option value="1000">Every 1s</option>
+                <option value="2000">Every 2s</option>
+                <option value="5000" selected>Every 5s</option>
+                <option value="10000">Every 10s</option>
+                <option value="30000">Every 30s</option>
+            </select>
+        </div>
+        <p class="refresh-interval" id="refresh-info"></p>
+
+        <div class="data-grid">
+            <div class="data-item full-width">
+                <div class="data-label">Latitude</div>
+                <div class="data-value large" id="latitude">--</div>
+            </div>
+
+            <div class="data-item full-width">
+                <div class="data-label">Longitude</div>
+                <div class="data-value large" id="longitude">--</div>
+            </div>
+
+            <div class="data-item">
+                <div class="data-label">Satellites</div>
+                <div class="data-value" id="satellites">--</div>
+            </div>
+
+            <div class="data-item">
+                <div class="data-label">Fix Status</div>
+                <div class="data-value" id="fix-status">--</div>
+            </div>
+
+            <div class="data-item">
+                <div class="data-label">HDOP (Accuracy)</div>
+                <div class="data-value" id="hdop">--</div>
+            </div>
+
+            <div class="data-item">
+                <div class="data-label">Date</div>
+                <div class="data-value" id="date-value">--</div>
+            </div>
+
+            <div class="data-item full-width">
+                <div class="data-label">Time (UTC)</div>
+                <div class="data-value" id="time-value">--</div>
+            </div>
+
+            <div class="data-item full-width">
+                <div class="data-label">Signal Quality</div>
+                <div class="quality-indicator">
+                    <div class="quality-bar">
+                        <div class="quality-fill" id="quality-fill" style="width: 0%"></div>
+                    </div>
+                    <div class="quality-text" id="quality-text">0%</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="map-link">
+            <a href="#" id="map-link" target="_blank">📍 Open in Google Maps</a>
+        </div>
+    </div>
+
+    <script>
+        const GPS_ENDPOINT = 'http://esp8266-gps.local/gps';
+        let autoRefreshInterval = null;
+        let refreshInterval = 5000;
+
+        async function fetchGPS() {
+            try {
+                const response = await fetch(GPS_ENDPOINT);
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+
+                const data = await response.json();
+                updateUI(data);
+                showError(null);
+            } catch (error) {
+                showError(`Connection failed: ${error.message}`);
+                updateUI(null);
+            }
+        }
+
+        function updateUI(data) {
+            const errorEl = document.getElementById('error-message');
+            
+            if (!data) {
+                document.getElementById('status-text').textContent = 'Offline';
+                document.querySelector('.status-indicator').classList.remove('online');
+                document.querySelector('.status-indicator').classList.add('offline');
+                return;
+            }
+
+            // Update status
+            document.getElementById('status-text').textContent = 'Online';
+            document.querySelector('.status-indicator').classList.remove('offline');
+            document.querySelector('.status-indicator').classList.add('online');
+
+            // Update values
+            document.getElementById('latitude').textContent = data.lat ? data.lat.toFixed(6) : '--';
+            document.getElementById('longitude').textContent = data.lng ? data.lng.toFixed(6) : '--';
+            document.getElementById('satellites').textContent = data.satellites || '--';
+            document.getElementById('hdop').textContent = data.hdop ? data.hdop.toFixed(2) : '--';
+            document.getElementById('date-value').textContent = data.date || '--';
+            document.getElementById('time-value').textContent = data.time || '--';
+
+            // Fix status
+            const fixStatus = data.fix === 1 ? '✓ Fix OK' : '✗ No Fix';
+            document.getElementById('fix-status').textContent = fixStatus;
+
+            // Signal quality (inverse of HDOP - lower is better)
+            let quality = 0;
+            if (data.hdop && data.hdop > 0) {
+                quality = Math.max(0, Math.min(100, 100 - (data.hdop * 2)));
+            }
+            document.getElementById('quality-fill').style.width = quality + '%';
+            document.getElementById('quality-text').textContent = Math.round(quality) + '%';
+
+            // Google Maps link
+            if (data.lat && data.lng) {
+                const mapUrl = `https://www.google.com/maps?q=${data.lat},${data.lng}`;
+                document.getElementById('map-link').href = mapUrl;
+                document.getElementById('map-link').style.display = 'block';
+            } else {
+                document.getElementById('map-link').style.display = 'none';
+            }
+        }
+
+        function showError(message) {
+            const errorEl = document.getElementById('error-message');
+            if (message) {
+                errorEl.textContent = '⚠️ ' + message;
+                errorEl.classList.add('show');
+            } else {
+                errorEl.classList.remove('show');
+            }
+        }
+
+        function toggleAutoRefresh() {
+            const btn = document.getElementById('auto-refresh-btn');
+            
+            if (autoRefreshInterval) {
+                clearInterval(autoRefreshInterval);
+                autoRefreshInterval = null;
+                btn.classList.remove('refresh-active');
+                btn.textContent = 'Auto: OFF';
+                document.getElementById('refresh-info').textContent = '';
+            } else {
+                autoRefreshInterval = setInterval(fetchGPS, refreshInterval);
+                btn.classList.add('refresh-active');
+                btn.textContent = 'Auto: ON';
+                updateRefreshInfo();
+                fetchGPS(); // Fetch immediately
+            }
+        }
+
+        function changeInterval() {
+            refreshInterval = parseInt(document.getElementById('interval-select').value);
+            
+            // Restart auto-refresh if it's running
+            if (autoRefreshInterval) {
+                clearInterval(autoRefreshInterval);
+                autoRefreshInterval = setInterval(fetchGPS, refreshInterval);
+                updateRefreshInfo();
+            }
+        }
+
+        function updateRefreshInfo() {
+            const seconds = (refreshInterval / 1000).toFixed(1);
+            document.getElementById('refresh-info').textContent = 
+                `Updates every ${seconds} second${seconds !== '1' ? 's' : ''}`;
+        }
+
+        // Fetch on page load
+        fetchGPS();
+    </script>
+</body>
+</html>

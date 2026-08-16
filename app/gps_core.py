@@ -1,36 +1,51 @@
 """
-GPS Core — serial port management and NMEA sentence parsing.
+GPS Core — Remote WiFi GPS unit reader.
 
-Handles the NEO-7M GPS module connected via UART (/dev/serial0).
-Key design decisions:
-- Uses pyserial (not stty) to configure the port, so Python controls all settings.
-- Saves/restores termios settings via atexit so that `cat /dev/serial0` still
-  works after the script exits (even on crash).
-- Auto-reconnects on serial errors without crashing the GUI.
+Reads GPS data from ESP8266 WiFi GPS unit via HTTP.
+Falls back to local serial port (/dev/serial0) if available.
+
+Key design:
+- Primary: Read from remote ESP8266-GPS unit (http://esp8266-gps.local/gps)
+- Fallback: Try local serial port (/dev/serial0) if remote unavailable
+- Auto-reconnects on network errors without crashing the GUI.
 - Returns raw float lat/lon alongside DMS strings so callers can use either.
 """
 
-import serial
-import pynmea2
+import requests
 import re
 import time
-import termios
 import os
 import atexit
+import json
+import threading
 
+# Try to import serial support (fallback for local GPS)
+try:
+    import serial
+    import pynmea2
+    import termios
+    SERIAL_AVAILABLE = True
+except ImportError:
+    SERIAL_AVAILABLE = False
+
+# Remote GPS unit endpoint
+# Try both hostname (mDNS) and IP address
+REMOTE_GPS_HOSTS = [
+    'esp8266-gps.local',  # Primary: mDNS hostname
+    '10.42.0.98',         # Fallback: known IP
+]
+REMOTE_GPS_TIMEOUT = 10  # seconds (increased for slower networks)
+
+# Fallback to local serial if remote unavailable
 SERIAL_PORT = '/dev/serial0'
 BAUD_RATE = 9600
 
-# Human-readable names for GGA quality indicator values
+# Human-readable names for GPS quality indicator values
 QUALITY_NAMES = ['No fix', 'GPS fix', 'DGPS fix', 'PPS fix']
 
 # Controls whether DMS format includes decimal seconds (e.g., 18.99" vs 19").
 # Modified at runtime by conf_view when user toggles the setting.
 SHOW_DMS_DECIMALS = False
-
-# Satellites in view, updated from GSV sentences.
-# Stored module-level because GSV and GGA arrive in separate sentences.
-_sats_in_view = '0'
 
 
 def _dd_to_dms(dd):
@@ -40,6 +55,9 @@ def _dd_to_dms(dd):
     SHOW_DMS_DECIMALS take effect immediately without waiting for
     a new GPS sentence.
     """
+    if dd is None or dd == 0:
+        return "--°--'--\""
+    
     d = int(dd)
     m_full = (dd - d) * 60
     m = int(m_full)
@@ -50,19 +68,82 @@ def _dd_to_dms(dd):
         return f"{d}\u00b0{m:02d}'{int(round(s)):02d}\""
 
 
+# ═══════════════════════════════════════════════════════════════
+# Remote GPS Reader (Primary)
+# ═══════════════════════════════════════════════════════════════
+
+def read_gps_remote():
+    """Read GPS data from remote ESP8266 WiFi unit.
+    
+    Tries multiple hosts (mDNS hostname, then IP) with fallback.
+    
+    Returns:
+        dict with 'status' key:
+            'fix'     — valid position (includes lat/lon/time/quality/sats)
+            'no_fix'  — GPS running but no satellite lock yet
+            'no_data' — network error or timeout
+            'error'   — HTTP error
+        None — if all attempts fail
+    """
+    for host in REMOTE_GPS_HOSTS:
+        url = f'http://{host}/gps'
+        try:
+            response = requests.get(url, timeout=REMOTE_GPS_TIMEOUT)
+            
+            if response.status_code == 200:
+                data = response.json()
+                
+                # Check if we have a fix
+                if data.get('fix') == 1 and data.get('lat') and data.get('lng'):
+                    return {
+                        'status': 'fix',
+                        'time': data.get('time', '--:--:--'),
+                        'lat': data.get('lat'),
+                        'lat_raw': data.get('lat'),
+                        'lat_dir': 'N' if data.get('lat', 0) >= 0 else 'S',
+                        'lon': data.get('lng'),
+                        'lon_raw': data.get('lng'),
+                        'lon_dir': 'E' if data.get('lng', 0) >= 0 else 'W',
+                        'quality': QUALITY_NAMES[min(1, 3)],  # GPS fix
+                        'sats_used': str(data.get('satellites', 0)),
+                        'sats_visible': str(data.get('satellites', 0)),
+                    }
+                else:
+                    # No fix yet
+                    return {
+                        'status': 'no_fix',
+                        'time': data.get('time', '--:--:--'),
+                        'sats_used': str(data.get('satellites', 0)),
+                        'sats_visible': str(data.get('satellites', 0)),
+                    }
+            
+            elif response.status_code == 503:
+                # GPS unit running but no fix yet
+                return {
+                    'status': 'no_fix',
+                    'time': '--:--:--',
+                    'sats_used': '0',
+                    'sats_visible': '0',
+                }
+        except Exception:
+            # This host failed, try next one
+            continue
+    
+    # All hosts failed
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════
+# Local Serial Fallback (Secondary)
+# ═══════════════════════════════════════════════════════════════
+
 _ser = None
 _original_termios = None
 
-
 def _save_port_settings():
-    """Save the serial port's original termios settings.
-
-    Done once before we open the port with pyserial. This lets us restore
-    the exact original state on exit, so other tools (cat, minicom) still
-    work on the port without needing `stty sane`.
-    """
+    """Save the serial port's original termios settings."""
     global _original_termios
-    if _original_termios is not None:
+    if not SERIAL_AVAILABLE or _original_termios is not None:
         return
     try:
         fd = os.open(SERIAL_PORT, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
@@ -73,13 +154,9 @@ def _save_port_settings():
 
 
 def _restore_port_settings():
-    """Restore the serial port to its original termios state.
-
-    Called on exit (via atexit) to undo any changes pyserial made.
-    Without this, `cat /dev/serial0` may show garbled output or nothing.
-    """
+    """Restore the serial port to its original termios state."""
     global _original_termios
-    if _original_termios is None:
+    if not SERIAL_AVAILABLE or _original_termios is None:
         return
     try:
         fd = os.open(SERIAL_PORT, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
@@ -90,12 +167,11 @@ def _restore_port_settings():
 
 
 def open_serial():
-    """Open the GPS serial port. Returns True on success, False on failure.
-
-    Closes any existing connection first to handle reconnection cleanly.
-    Saves termios before opening so we can restore on exit.
-    """
+    """Open the GPS serial port. Returns True on success, False on failure."""
     global _ser
+    if not SERIAL_AVAILABLE:
+        return False
+        
     if _ser:
         try:
             _ser.close()
@@ -112,110 +188,79 @@ def open_serial():
             bytesize=serial.EIGHTBITS,
             parity=serial.PARITY_NONE,
             stopbits=serial.STOPBITS_ONE,
-            # 0.1s timeout: must be short to avoid blocking the tkinter main loop.
-            # GPS sends data every 1s; we poll frequently with short timeout.
             timeout=0.1,
         )
         _ser.reset_input_buffer()
         return True
-    except (serial.SerialException, OSError) as e:
+    except Exception as e:
         print(f"Cannot open serial port: {e}")
         _ser = None
         return False
 
 
-def read_gps():
-    """Read one NMEA sentence and return parsed GPS data.
-
-    Returns:
-        dict with 'status' key:
-            'fix'     — valid position (includes lat/lon/time/quality/sats)
-            'no_fix'  — GPS running but no satellite lock yet
-            'no_data' — empty read (timeout, no sentence available)
-            'error'   — serial port problem (will auto-reconnect next call)
-        None — sentence was not GGA/GSV (ignored, call again)
-
-    Design: returns raw floats (lat_raw, lon_raw) alongside formatted DMS
-    strings. The raw values are used by the map for positioning; the DMS
-    strings are legacy and may be removed in the future since coords_view
-    now formats at display time using _dd_to_dms() directly.
+def read_gps_serial():
+    """Read GPS data from local serial port (fallback).
+    
+    Returns dict with 'status' key or None.
     """
-    global _sats_in_view, _ser
-
-    # Auto-reconnect if port was lost
-    if not _ser or not _ser.is_open:
+    global _ser
+    if not SERIAL_AVAILABLE or not _ser or not _ser.is_open:
         if not open_serial():
-            time.sleep(1)
-            return {'status': 'error', 'message': 'Cannot open serial port'}
+            return None
 
     try:
         raw = _ser.readline()
-    except (serial.SerialException, OSError) as e:
-        # Port disappeared (USB unplug, kernel error). Close and let next
-        # call attempt reconnection.
-        print(f"Serial error: {e}")
+    except Exception as e:
         try:
             _ser.close()
         except Exception:
             pass
         _ser = None
-        time.sleep(1)
-        return {'status': 'error', 'message': str(e)}
+        return None
 
     if not raw:
         return {'status': 'no_data'}
 
     line = raw.decode('ascii', errors='replace').strip()
-    if not line:
-        return None
-    if not line.startswith('$'):
+    if not line or not line.startswith('$'):
         return None
 
-    # GSV sentences carry satellite-in-view count. We extract it here
-    # and store it module-level because GGA (position) sentences don't
-    # include this information.
-    if line.startswith('$GPGSV') or line.startswith('$GNGSV'):
-        match = re.match(r'\$G[PN]GSV,\d+,\d+,(\d+)', line)
-        if match:
-            _sats_in_view = match.group(1)
-        return None
-
-    # Only process GGA sentences (position + quality + sat count)
+    # Only process GGA sentences (position + quality)
     if not (line.startswith('$GPGGA') or line.startswith('$GNGGA')):
         return None
 
     try:
         msg = pynmea2.parse(line)
-    except pynmea2.ParseError:
+    except Exception:
         return None
 
     if msg.lat_dir:
         return {
             'status': 'fix',
             'time': str(msg.timestamp),
-            'lat': _dd_to_dms(msg.latitude),
+            'lat': msg.latitude,
             'lat_raw': msg.latitude,
             'lat_dir': msg.lat_dir,
-            'lon': _dd_to_dms(msg.longitude),
+            'lon': msg.longitude,
             'lon_raw': msg.longitude,
             'lon_dir': msg.lon_dir,
             'quality': QUALITY_NAMES[min(msg.gps_qual, 3)],
             'sats_used': str(msg.num_sats or '0'),
-            'sats_visible': _sats_in_view,
+            'sats_visible': str(msg.num_sats or '0'),
         }
     else:
         return {
             'status': 'no_fix',
             'time': str(msg.timestamp),
             'sats_used': str(msg.num_sats or '0'),
-            'sats_visible': _sats_in_view,
+            'sats_visible': str(msg.num_sats or '0'),
         }
 
 
 def close():
     """Close serial port and restore original termios settings."""
     global _ser
-    if _ser:
+    if SERIAL_AVAILABLE and _ser:
         try:
             _ser.close()
         except Exception:
@@ -224,14 +269,38 @@ def close():
     _restore_port_settings()
 
 
-# ─── Background GPS reader thread ───
-# GPS reading is done in a background thread to avoid blocking the tkinter
-# main loop. Without this, the 0.1s serial timeout would freeze the UI
-# (especially camera display) every time read_gps() is called.
-# The main thread polls get_latest() which returns instantly.
-# Runs continuously, stores latest parsed data in _latest_data.
-# The main thread (tkinter) reads _latest_data without blocking.
-import threading
+# ═══════════════════════════════════════════════════════════════
+# Main GPS Reader (with Fallback Logic)
+# ═══════════════════════════════════════════════════════════════
+
+def read_gps():
+    """Read GPS data with fallback priority.
+    
+    Priority:
+    1. Try remote ESP8266-GPS unit first (WiFi)
+    2. Fall back to local serial port if remote fails
+    3. Return no_data if both fail
+    
+    Returns dict with 'status' key or None.
+    """
+    # Try remote GPS first (primary)
+    data = read_gps_remote()
+    if data is not None:
+        return data
+    
+    # Fallback to local serial (secondary)
+    if SERIAL_AVAILABLE:
+        data = read_gps_serial()
+        if data is not None:
+            return data
+    
+    # Both failed
+    return {'status': 'no_data'}
+
+
+# ═══════════════════════════════════════════════════════════════
+# Background GPS Reader Thread
+# ═══════════════════════════════════════════════════════════════
 
 _latest_data = None
 _gps_thread = None
@@ -239,28 +308,30 @@ _gps_running = False
 
 
 def _gps_reader_loop():
-    """Background thread: continuously reads GPS and stores latest result.
-    Clears stored data after repeated errors (GPS disconnected)."""
+    """Background thread: continuously reads GPS and stores latest result."""
     global _latest_data
     _error_count = 0
+    
     while _gps_running:
         data = read_gps()
+        
         if data is not None and data.get('status') in ('fix', 'no_fix'):
             _latest_data = data
             _error_count = 0
         elif data is not None and data.get('status') == 'error':
             _error_count += 1
-            # After 3 consecutive errors (~3s), clear data to signal GPS lost
             if _error_count >= 3:
                 _latest_data = None
         elif data is not None and data.get('status') == 'no_data':
             _error_count += 1
-            if _error_count >= 30:
-                # 30 empty reads (~3s at 0.1s timeout) = GPS disconnected
+            if _error_count >= 10:
                 _latest_data = None
-        # Small sleep to prevent tight loop when no data
+        
+        # Small sleep to prevent tight loop
         if data is None or (data and data.get('status') == 'no_data'):
-            time.sleep(0.05)
+            time.sleep(0.5)
+        else:
+            time.sleep(0.1)
 
 
 def start_background_reader():
@@ -282,4 +353,5 @@ def get_latest():
     return _latest_data
 
 
+# Cleanup on exit
 atexit.register(close)
