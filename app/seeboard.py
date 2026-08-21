@@ -27,6 +27,9 @@ from views import map_view
 from views import cam_view
 from views import conf_view
 
+from route_database import RouteDatabase
+from route_recorder import RouteRecorder
+
 # Ensure serial port is always restored on exit, even on crash.
 # Without this, the port can be left in a bad state and `cat /dev/serial0`
 # would stop working until a manual `stty sane`.
@@ -74,6 +77,25 @@ def save_config(cfg):
     if not cfg.has_option("coords", "error_color"):
         cfg.set("coords", "error_color", "red")
 
+    if not cfg.has_section("route_recording"):
+        cfg.add_section("route_recording")
+    if not cfg.has_option("route_recording", "sampling_mode"):
+        cfg.set("route_recording", "sampling_mode", "distance")
+    if not cfg.has_option("route_recording", "distance_threshold"):
+        cfg.set("route_recording", "distance_threshold", "15.0")
+    if not cfg.has_option("route_recording", "time_threshold"):
+        cfg.set("route_recording", "time_threshold", "10")
+    if not cfg.has_option("route_recording", "line_color"):
+        cfg.set("route_recording", "line_color", "RED")
+    if not cfg.has_option("route_recording", "line_width"):
+        cfg.set("route_recording", "line_width", "3")
+    if not cfg.has_option("route_recording", "line_style"):
+        cfg.set("route_recording", "line_style", "continuous")
+    if not cfg.has_option("route_recording", "point_color"):
+        cfg.set("route_recording", "point_color", "red")
+    if not cfg.has_option("route_recording", "point_diameter"):
+        cfg.set("route_recording", "point_diameter", "8")
+
     with open(CONFIG_FILE, "w") as f:
         f.write("# seeBoard configuration\n")
         f.write("#\n")
@@ -87,13 +109,28 @@ def save_config(cfg):
         f.write("#   fix_color:   lime / red / cyan / yellow (default: lime)\n")
         f.write("#   nofix_color: lime / red / cyan / yellow (default: red)\n")
         f.write("#   error_color: red (default: red)\n")
+        f.write("#\n")
+        f.write("# [route_recording]\n")
+        f.write("#   sampling_mode: distance / time (default: distance)\n")
+        f.write("#   distance_threshold: meters (default: 15.0)\n")
+        f.write("#   time_threshold: seconds (default: 10)\n")
+        f.write("#   line_color: RED / BLUE / GREEN / etc or #RRGGBB (default: RED)\n")
+        f.write("#   line_width: pixels (default: 3)\n")
+        f.write("#   line_style: continuous / dotted / dashed / dashdot (default: continuous)\n")
+        f.write("#   point_color: red / blue / green / yellow / etc (default: red)\n")
+        f.write("#   point_diameter: pixels (default: 8)\n")
         f.write("\n")
         cfg.write(f)
 
 
 
 config = load_config()
+save_config(config)  # Initialize/update all config defaults at startup
 gps_core.SHOW_DMS_DECIMALS = config.getboolean("gps", "show_dms_decimals", fallback=False)
+
+# ─── Initialize route recording ───
+route_db = RouteDatabase()
+route_recorder = RouteRecorder(route_db)
 
 # ─── Main window ───
 root = tk.Tk()
@@ -132,7 +169,7 @@ content.pack(side='left', fill='both', expand=True)
 # (not destroyed/recreated) to preserve state and avoid flicker.
 coords_frame, update_gps, coords_on_show = coords_view.create(
     content, fonts, config, CONFIG_FILE)
-map_frame, map_widget, marker = map_view.create(content)
+map_frame, map_widget, marker, route_lines = map_view.create(content)
 cam_frame, cam_label = cam_view.create(content, fonts)
 conf_frame = conf_view.create(content, fonts, config, save_config, CONFIG_FILE)
 
@@ -211,13 +248,60 @@ conf_btn = tk.Button(btn_panel, text="CONF", font=fonts["FONT_BTN"],
                      command=lambda: show_view('conf'))
 conf_btn.pack(fill='x', padx=5, pady=5, ipady=12)
 
+# ─── REC/STOP buttons for route recording ───
+def on_rec_pressed():
+    """Start or auto-restart route recording"""
+    gps_data = gps_core.get_latest()
+    
+    if gps_data and gps_data.get('status') == 'fix':
+        config_fresh = load_config()
+        sampling_mode = config_fresh.get('route_recording', 'sampling_mode', fallback='distance')
+        rec_config = {
+            'line_color': config_fresh.get('route_recording', 'line_color', fallback='RED'),
+            'line_width': config_fresh.getint('route_recording', 'line_width', fallback=3),
+            'line_style': config_fresh.get('route_recording', 'line_style', fallback='continuous'),
+            'sampling_mode': sampling_mode,
+            'sampling_value': config_fresh.getfloat(
+                'route_recording', 
+                'distance_threshold' if sampling_mode == 'distance' 
+                else 'time_threshold',
+                fallback=15.0 if sampling_mode == 'distance' else 10.0
+            )
+        }
+        route_recorder.start_recording(gps_data, rec_config)
+        update_button_states()
+
+
+def on_stop_pressed():
+    """Stop route recording"""
+    route_recorder.stop_recording()
+    update_button_states()
+
+
+def update_button_states():
+    """Update button appearance based on recording state"""
+    if route_recorder.is_recording():
+        # Recording active: REC is RED, STOP is active (LIME)
+        rec_btn.config(bg='#666666', fg='red', state='normal')
+        stop_btn.config(bg='#666666', fg='lime', state='normal')
+    else:
+        # Not recording: REC is WHITE, STOP is inactive (GRAY)
+        rec_btn.config(bg='#444444', fg='white', state='normal')
+        stop_btn.config(bg='#444444', fg='gray', state='disabled')
+
+
+rec_btn = tk.Button(btn_panel, text="REC", font=fonts["FONT_BTN"],
+                    bg='#444444', fg='white', activebackground='#666666',
+                    command=on_rec_pressed)
+rec_btn.pack(fill='x', padx=5, pady=5, ipady=12)
+
+stop_btn = tk.Button(btn_panel, text="STOP", font=fonts["FONT_BTN"],
+                     bg='#444444', fg='gray', activebackground='#666666',
+                     state='disabled', command=on_stop_pressed)
+stop_btn.pack(fill='x', padx=5, pady=5, ipady=12)
+
 # TODO: SAVE button — will store current position as waypoint in SQLite
 tk.Button(btn_panel, text="SAVE", font=fonts["FONT_BTN"],
-          bg='#444444', fg='gray', state='disabled'
-          ).pack(fill='x', padx=5, pady=5, ipady=12)
-
-# TODO: REC/STOP button — will record GPS track to SQLite
-tk.Button(btn_panel, text="REC", font=fonts["FONT_BTN"],
           bg='#444444', fg='gray', state='disabled'
           ).pack(fill='x', padx=5, pady=5, ipady=12)
 
@@ -235,6 +319,7 @@ def on_close():
     running[0] = False
     cam_view.stop_all()
     gps_core.stop_background_reader()
+    route_db.close()
     root.destroy()
 
 
@@ -242,8 +327,34 @@ root.protocol("WM_DELETE_WINDOW", on_close)
 
 # ─── Start update loops ───
 # GPS updates every 1s (matches NMEA sentence rate from NEO-7M).
+# Includes route recording point capture based on sampling threshold.
+def gps_update_with_recording(root, get_view_mode, marker, map_widget, config):
+    """Update GPS display and route recording"""
+    gps_data = gps_core.get_latest()
+    
+    # If recording and we have GPS data, check if we should record a point
+    if route_recorder.is_recording() and gps_data and gps_data.get('status') == 'fix':
+        if route_recorder.should_record_point(gps_data):
+            route_recorder.add_point(gps_data)
+        
+        # Always redraw route while recording (not just when adding new points)
+        # This ensures route stays visible even if sampling threshold hasn't been met
+        from views import map_view
+        map_view.draw_route(map_widget, route_lines, route_db, route_recorder, config)
+        
+        # Redraw circles to ensure they're visible after any map pans/zooms
+        map_view.redraw_route_circles_on_view_change(map_widget)
+    
+    # Continue with normal GPS update (passing route_recorder for status display)
+    update_gps(root, get_view_mode, marker, map_widget, route_recorder)
+    
+    # Reschedule for next update
+    root.after(1000, lambda: gps_update_with_recording(root, get_view_mode, marker, map_widget, config))
+
+
 # Camera updates every 50ms (~20fps) for smooth video.
-root.after(1000, lambda: update_gps(root, get_view_mode, marker, map_widget))
+root.after(1000, lambda: gps_update_with_recording(root, get_view_mode, marker, map_widget, config))
 cam_view.update_cam(root, cam_label, config, get_view_mode, running)
 root.mainloop()
 close()
+route_db.close()

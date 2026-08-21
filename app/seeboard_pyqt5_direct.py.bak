@@ -1,0 +1,1096 @@
+#!/usr/bin/env python3
+"""
+seeBoard PyQt5 Application - Direct Backend Access
+Uses same camera streaming pattern as working tkinter app
+"""
+
+import sys
+import os
+import threading
+import time
+from configparser import ConfigParser
+from datetime import datetime
+import io
+import math
+import tempfile
+
+# Add app directory to path
+script_dir = os.path.dirname(os.path.abspath(__file__))
+app_dir = os.path.join(script_dir, 'app')
+sys.path.insert(0, script_dir)
+sys.path.insert(0, app_dir)
+
+# PyQt5 imports
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QTabWidget, QLabel, QPushButton, QGridLayout, QCheckBox,
+    QSlider, QComboBox, QScrollArea
+)
+from PyQt5.QtCore import Qt, pyqtSignal, QObject, QThread, QTimer
+from PyQt5.QtGui import QFont, QColor, QImage, QPixmap
+
+# Backend imports
+import gps_core
+import cam_discovery
+import map_generator
+import route_recorder as route_recorder_module
+from route_database import RouteDatabase
+from route_recorder import RouteRecorder
+
+# Global route recorder
+_db = None
+global_route_recorder = None
+
+def init_route_recorder():
+    global _db, global_route_recorder
+    _db = RouteDatabase()
+    global_route_recorder = RouteRecorder(_db)
+
+
+# ============================================================================
+# CAMERA STREAMING - Same pattern as tkinter app
+# ============================================================================
+
+_streams = {}  # {url: {"running": bool, "frame": bytes|None, "last_frame_time": float}}
+_known_urls = set()
+_NO_SIGNAL_TIMEOUT = 3
+
+
+def _is_stale(state):
+    """Check if a camera stream has not received frames for too long."""
+    return (time.time() - state.get("last_frame_time", 0)) > _NO_SIGNAL_TIMEOUT
+
+
+def _reader(url, state):
+    """Background thread: reads MJPEG stream, extracts JPEG frames (from tkinter cam_view.py)"""
+    MAX_BUF = 200000
+    while state["running"]:
+        try:
+            import urllib.request
+            stream = urllib.request.urlopen(url, timeout=5)
+            stream.fp.raw._sock.settimeout(10)
+            buf = b""
+            while state["running"]:
+                chunk = stream.read(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                if len(buf) > MAX_BUF:
+                    buf = buf[-MAX_BUF:]
+                while True:
+                    s = buf.find(b"\xff\xd8")
+                    e = buf.find(b"\xff\xd9", s + 2) if s != -1 else -1
+                    if s != -1 and e != -1:
+                        state["frame"] = buf[s:e + 2]
+                        state["last_frame_time"] = time.time()
+                        buf = buf[e + 2:]
+                    else:
+                        break
+        except Exception:
+            pass
+        time.sleep(1)
+
+
+def start_new_cameras():
+    """Start streams for newly discovered cameras"""
+    global _known_urls
+    cameras = cam_discovery.get_cameras()
+    new_urls = {url for url in cameras.values()} - _known_urls
+    for url in new_urls:
+        state = {"running": True, "frame": None, "last_frame_time": time.time()}
+        t = threading.Thread(target=_reader, args=(url, state), daemon=True)
+        t.start()
+        _streams[url] = state
+        _known_urls.add(url)
+
+
+def stop_all_cameras():
+    """Stop all camera streams"""
+    for s in _streams.values():
+        s["running"] = False
+    _streams.clear()
+    _known_urls.clear()
+
+
+# ============================================================================
+# GPS WORKER
+# ============================================================================
+
+class GPSSignals(QObject):
+    updated = pyqtSignal(dict)
+
+
+class GPSWorker(QThread):
+    signals = GPSSignals()
+    
+    def __init__(self):
+        super().__init__()
+        self._stop_event = threading.Event()
+    
+    def run(self):
+        while not self._stop_event.is_set():
+            try:
+                data = gps_core.get_latest()
+                if data:
+                    self.signals.updated.emit(data)
+            except Exception as e:
+                print(f"[GPS Error] {e}")
+            self._stop_event.wait(0.5)
+    
+    def stop(self):
+        self._stop_event.set()
+
+
+# ============================================================================
+# TABS
+# ============================================================================
+
+class CoordsTab(QWidget):
+    """GPS Coordinates Display - matching tkinter style"""
+    
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.recording = False
+        self.initUI()
+        
+        # Start GPS worker
+        self.gps_worker = GPSWorker()
+        self.gps_worker.signals.updated.connect(self.update_gps)
+        self.gps_worker.start()
+    
+    def initUI(self):
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        
+        # Black background
+        self.setStyleSheet("background-color: black;")
+        
+        # Calculate font sizes relative to screen height
+        screen_height = QApplication.primaryScreen().geometry().height()
+        
+        # ─── COORDINATES CONTAINER (top) ───
+        coords_container = QWidget()
+        coords_container.setStyleSheet("background-color: black;")
+        coords_layout = QVBoxLayout()
+        coords_layout.setContentsMargins(10, 20, 10, 20)
+        coords_layout.setSpacing(0)
+        
+        # Load coordinate settings
+        try:
+            coord_font_size = int(self.config.get('gps', 'coord_font_size', fallback='65'))
+            color_name = self.config.get('gps', 'coord_color', fallback='lime')
+            color_map = {
+                'yellow': '#FFFF00',
+                'white': '#FFFFFF',
+                'cyan': '#00FFFF',
+                'lime': '#00FF00',
+                'red': '#FF0000',
+                'orange': '#FFA500',
+            }
+            color_hex = color_map.get(color_name, '#00FF00')
+        except:
+            coord_font_size = 65
+            color_hex = '#00FF00'
+        
+        # LAT coordinate
+        self.lat_label = QLabel("--°--'--\"")
+        self.lat_label.setFont(QFont("Helvetica", coord_font_size, QFont.Bold))
+        self.lat_label.setStyleSheet(f"color: {color_hex}; background-color: black;")
+        self.lat_label.setAlignment(Qt.AlignCenter)
+        coords_layout.addWidget(self.lat_label)
+        
+        # LON coordinate
+        self.lon_label = QLabel("---°--'--\"")
+        self.lon_label.setFont(QFont("Helvetica", coord_font_size, QFont.Bold))
+        self.lon_label.setStyleSheet(f"color: {color_hex}; background-color: black;")
+        self.lon_label.setAlignment(Qt.AlignCenter)
+        coords_layout.addWidget(self.lon_label)
+        
+        coords_container.setLayout(coords_layout)
+        layout.addWidget(coords_container, 1)  # Top container, stretch
+        
+        # ─── METADATA CONTAINER (bottom) ───
+        meta_container = QWidget()
+        meta_container.setStyleSheet("background-color: black;")
+        meta_layout = QVBoxLayout()
+        meta_layout.setContentsMargins(10, 5, 10, 5)
+        meta_layout.setSpacing(2)
+        
+        # Load metadata settings
+        try:
+            meta_font_size = int(self.config.get('gps', 'meta_font_size', fallback='12'))
+            meta_color_name = self.config.get('gps', 'meta_color', fallback='white')
+            meta_color_hex = color_map.get(meta_color_name, '#FFFFFF')
+        except:
+            meta_font_size = 12
+            meta_color_hex = '#FFFFFF'
+        
+        # Time label
+        self.time_label = QLabel("Time: --:--:--")
+        self.time_label.setFont(QFont("Helvetica", meta_font_size))
+        self.time_label.setStyleSheet(f"color: {meta_color_hex}; background-color: black;")
+        self.time_label.setAlignment(Qt.AlignCenter)
+        meta_layout.addWidget(self.time_label)
+        
+        # Quality label
+        self.qual_label = QLabel("Quality: -")
+        self.qual_label.setFont(QFont("Helvetica", meta_font_size))
+        self.qual_label.setStyleSheet(f"color: {meta_color_hex}; background-color: black;")
+        self.qual_label.setAlignment(Qt.AlignCenter)
+        meta_layout.addWidget(self.qual_label)
+        
+        # Satellites label
+        self.sat_label = QLabel("Satellites: - used / - visible")
+        self.sat_label.setFont(QFont("Helvetica", meta_font_size))
+        self.sat_label.setStyleSheet(f"color: {meta_color_hex}; background-color: black;")
+        self.sat_label.setAlignment(Qt.AlignCenter)
+        meta_layout.addWidget(self.sat_label)
+        
+        # Recording label
+        self.recording_label = QLabel("")
+        self.recording_label.setFont(QFont("Helvetica", meta_font_size))
+        self.recording_label.setStyleSheet(f"color: red; background-color: black;")
+        self.recording_label.setAlignment(Qt.AlignCenter)
+        meta_layout.addWidget(self.recording_label)
+        
+        # Status label
+        self.status_label = QLabel("")
+        self.status_label.setFont(QFont("Helvetica", meta_font_size))
+        self.status_label.setStyleSheet(f"color: red; background-color: black;")
+        self.status_label.setAlignment(Qt.AlignCenter)
+        meta_layout.addWidget(self.status_label)
+        
+        meta_container.setLayout(meta_layout)
+        layout.addWidget(meta_container, 0)  # Bottom container, no stretch
+        
+        # ─── REC/STOP buttons ───
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(10)
+        btn_layout.setContentsMargins(10, 10, 10, 10)
+        
+        self.rec_button = QPushButton("REC")
+        self.rec_button.setStyleSheet("""
+            QPushButton {
+                background-color: red;
+                color: white;
+                font-weight: bold;
+                font-size: 14px;
+                padding: 10px;
+                border-radius: 4px;
+                min-height: 40px;
+            }
+            QPushButton:pressed {
+                background-color: darkred;
+            }
+        """)
+        self.rec_button.clicked.connect(self.start_recording)
+        btn_layout.addWidget(self.rec_button)
+        
+        self.stop_button = QPushButton("STOP")
+        self.stop_button.setStyleSheet("""
+            QPushButton {
+                background-color: green;
+                color: white;
+                font-weight: bold;
+                font-size: 14px;
+                padding: 10px;
+                border-radius: 4px;
+                min-height: 40px;
+            }
+            QPushButton:pressed {
+                background-color: darkgreen;
+            }
+        """)
+        self.stop_button.setEnabled(False)
+        self.stop_button.clicked.connect(self.stop_recording)
+        btn_layout.addWidget(self.stop_button)
+        
+        layout.addLayout(btn_layout)
+        
+        self.setLayout(layout)
+    
+    def on_tab_shown(self):
+        """Called when this tab becomes visible - reload config"""
+        try:
+            gps_core.SHOW_DMS_DECIMALS = self.config.getboolean('gps', 'show_dms_decimals', fallback=False)
+        except:
+            gps_core.SHOW_DMS_DECIMALS = False
+        
+        # Reload font size and color for coordinates
+        try:
+            font_size = int(self.config.get('gps', 'coord_font_size', fallback='65'))
+            color_name = self.config.get('gps', 'coord_color', fallback='lime')
+            color_map = {
+                'yellow': '#FFFF00',
+                'white': '#FFFFFF',
+                'cyan': '#00FFFF',
+                'lime': '#00FF00',
+                'red': '#FF0000',
+                'orange': '#FFA500',
+            }
+            color_hex = color_map.get(color_name, '#00FF00')
+        except:
+            font_size = 65
+            color_hex = '#00FF00'
+        
+        self.lat_label.setFont(QFont("Helvetica", font_size, QFont.Bold))
+        self.lon_label.setFont(QFont("Helvetica", font_size, QFont.Bold))
+        self.lat_label.setStyleSheet(f"color: {color_hex}; background-color: black;")
+        self.lon_label.setStyleSheet(f"color: {color_hex}; background-color: black;")
+        
+        # Reload metadata font size and color
+        try:
+            meta_font_size = int(self.config.get('gps', 'meta_font_size', fallback='12'))
+            meta_color_name = self.config.get('gps', 'meta_color', fallback='white')
+            meta_color_hex = color_map.get(meta_color_name, '#FFFFFF')
+        except:
+            meta_font_size = 12
+            meta_color_hex = '#FFFFFF'
+        
+        self.time_label.setFont(QFont("Helvetica", meta_font_size))
+        self.qual_label.setFont(QFont("Helvetica", meta_font_size))
+        self.sat_label.setFont(QFont("Helvetica", meta_font_size))
+        self.recording_label.setFont(QFont("Helvetica", meta_font_size))
+        self.status_label.setFont(QFont("Helvetica", meta_font_size))
+        self.time_label.setStyleSheet(f"color: {meta_color_hex}; background-color: black;")
+        self.qual_label.setStyleSheet(f"color: {meta_color_hex}; background-color: black;")
+        self.sat_label.setStyleSheet(f"color: {meta_color_hex}; background-color: black;")
+    
+    def update_gps(self, data):
+        # Get the configured coordinate color
+        try:
+            color_name = self.config.get('gps', 'coord_color', fallback='lime')
+            color_map = {
+                'yellow': '#FFFF00',
+                'white': '#FFFFFF',
+                'cyan': '#00FFFF',
+                'lime': '#00FF00',
+                'red': '#FF0000',
+                'orange': '#FFA500',
+            }
+            coord_color = color_map.get(color_name, '#00FF00')
+        except:
+            coord_color = '#00FF00'
+        
+        if data and data.get('status') == 'fix':
+            lat_decimal = data.get('lat', 0)
+            lon_decimal = data.get('lon', 0)
+            lat_dms = gps_core._dd_to_dms(lat_decimal)
+            lon_dms = gps_core._dd_to_dms(lon_decimal)
+            
+            # Use configured color for fix
+            self.lat_label.setStyleSheet(f"color: {coord_color}; background-color: black;")
+            self.lon_label.setStyleSheet(f"color: {coord_color}; background-color: black;")
+            
+            self.lat_label.setText(lat_dms)
+            self.lon_label.setText(lon_dms)
+            
+            time_str = data.get('time', '--:--:--')
+            qual_str = data.get('quality', 'No Fix')
+            sats_used = data.get('sats_used', 0)
+            sats_visible = data.get('sats_visible', 0)
+            
+            self.time_label.setText(f"Time: {time_str}")
+            self.qual_label.setText(f"Quality: {qual_str}")
+            self.sat_label.setText(f"Satellites: {sats_used} used / {sats_visible} visible")
+            self.status_label.setText("")
+            
+            # If recording, add point to route
+            if self.recording and data.get('lat') and data.get('lon'):
+                try:
+                    global_route_recorder.add_point({
+                        'lat': data.get('lat'),
+                        'lon': data.get('lon'),
+                        'time': datetime.now().isoformat()
+                    })
+                except Exception as e:
+                    print(f"[REC] Error adding point: {e}")
+        
+        elif data and data.get('status') == 'no_fix':
+            # Orange for no fix
+            self.lat_label.setStyleSheet("color: #FFA500; background-color: black;")
+            self.lon_label.setStyleSheet("color: #FFA500; background-color: black;")
+            
+            self.lat_label.setText("--°--'--\"")
+            self.lon_label.setText("---°--'--\"")
+            
+            time_str = data.get('time', '--:--:--')
+            sats_used = data.get('sats_used', 0)
+            sats_visible = data.get('sats_visible', 0)
+            
+            self.time_label.setText(f"Time: {time_str}")
+            self.qual_label.setText("Quality: No fix")
+            self.sat_label.setText(f"Satellites: {sats_used} used / {sats_visible} visible")
+            self.status_label.setText("Waiting for fix...")
+        else:
+            # Red for no GPS
+            self.lat_label.setStyleSheet("color: #FF0000; background-color: black;")
+            self.lon_label.setStyleSheet("color: #FF0000; background-color: black;")
+            
+            self.lat_label.setText("--°--'--\"")
+            self.lon_label.setText("---°--'--\"")
+            self.time_label.setText("Time: --:--:--")
+            self.qual_label.setText("Quality: -")
+            self.sat_label.setText("Satellites: - used / - visible")
+            self.status_label.setText("⚠ No GPS data")
+        
+        # Update recording status
+        if self.recording:
+            self.recording_label.setText("🔴 RECORDING")
+        else:
+            self.recording_label.setText("")
+    
+    def start_recording(self):
+        self.recording = True
+        self.rec_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+        try:
+            global_route_recorder.start_recording({}, {})
+            print("[REC] Recording started")
+        except Exception as e:
+            print(f"[REC] Error: {e}")
+            self.recording = False
+            self.rec_button.setEnabled(True)
+            self.stop_button.setEnabled(False)
+    
+    def stop_recording(self):
+        self.recording = False
+        self.rec_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        try:
+            global_route_recorder.stop_recording()
+            print("[REC] Recording stopped")
+        except Exception as e:
+            print(f"[REC] Error: {e}")
+
+
+class MapTab(QWidget):
+    """Map Display"""
+    
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        
+        layout = QVBoxLayout()
+        self.map_label = QLabel("Map View - Route Recording\n\nNo route recorded yet")
+        self.map_label.setFont(QFont("Arial", 14))
+        self.map_label.setMinimumHeight(400)
+        self.map_label.setStyleSheet("border: 1px solid black; background: white; padding: 20px;")
+        self.map_label.setAlignment(Qt.AlignCenter)
+        
+        layout.addWidget(self.map_label)
+        self.setLayout(layout)
+
+
+class CamTab(QWidget):
+    """Camera Display - uses same pattern as tkinter"""
+    
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        
+        layout = QVBoxLayout()
+        self.cam_label = QLabel("Searching for cameras...")
+        self.cam_label.setFont(QFont("Arial", 14))
+        self.cam_label.setMinimumHeight(400)
+        self.cam_label.setStyleSheet("border: 1px solid black; background: black;")
+        self.cam_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.cam_label)
+        self.setLayout(layout)
+        
+        # Timer to update camera display every 50ms (same as tkinter)
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_display)
+        self.timer.start(50)
+    
+    def update_display(self):
+        """Update camera display - same as tkinter's update_cam"""
+        try:
+            start_new_cameras()
+            urls = list(_streams.keys())
+            n = len(urls)
+            
+            if n == 0:
+                self.cam_label.setPixmap(QPixmap())
+                self.cam_label.setText("Searching for cameras...")
+                return
+            
+            # Create composite image
+            cols = math.ceil(math.sqrt(n))
+            rows = math.ceil(n / cols)
+            
+            w = 800
+            h = 600
+            cell_w = w // cols
+            cell_h = h // rows
+            
+            from PIL import Image as PILImage
+            composite = PILImage.new("RGB", (w, h), "black")
+            has_frame = False
+            frame_count = 0
+            
+            for i, url in enumerate(urls):
+                f = _streams[url]["frame"]
+                if f:
+                    frame_count += 1
+                    has_frame = True
+                    try:
+                        img = PILImage.open(io.BytesIO(f))
+                        
+                        # Ensure RGB
+                        if img.mode != 'RGB':
+                            img = img.convert('RGB')
+                        
+                        rot = self.config.getint("cam", "rotation", fallback=0)
+                        if rot:
+                            img = img.rotate(-rot, expand=True)
+                        iw, ih = img.size
+                        scale = min(cell_w / iw, cell_h / ih)
+                        img = img.resize((int(iw * scale), int(ih * scale)), PILImage.BILINEAR)
+                        
+                        r = i // cols
+                        c = i % cols
+                        x = c * cell_w
+                        y = r * cell_h
+                        composite.paste(img, (x, y))
+                    except Exception as e:
+                        print(f"[CAM] Frame {i} error: {e}")
+            
+            if has_frame:
+                print(f"[CAM] Displaying {frame_count} frames")
+                # Convert PIL image to QPixmap using different method
+                try:
+                    # Save to bytes and load with QPixmap
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+                        composite.save(tmp.name, 'PNG')
+                        pixmap = QPixmap(tmp.name)
+                        os.unlink(tmp.name)
+                    self.cam_label.setPixmap(pixmap)
+                    self.cam_label.setText("")
+                except Exception as e:
+                    print(f"[CAM] QPixmap conversion error: {e}")
+                
+        except Exception as e:
+            print(f"[CAM] Display error: {e}")
+    
+    def closeEvent(self, event):
+        self.timer.stop()
+        stop_all_cameras()
+        super().closeEvent(event)
+
+
+class ConfTab(QWidget):
+    """Configuration - with GPS, Camera, Map sections - professional styling - auto-save"""
+    
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.initUI()
+    
+    def initUI(self):
+        layout = QVBoxLayout()
+        
+        # Create scrollable area
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { background-color: #f5f5f5; border: none; }")
+        scroll_widget = QWidget()
+        scroll_widget.setStyleSheet("background-color: #f5f5f5;")
+        scroll_layout = QVBoxLayout()
+        scroll_layout.setSpacing(15)
+        scroll_layout.setContentsMargins(10, 10, 10, 10)
+        
+        # ─── GPS SECTION ───
+        scroll_layout.addWidget(self._create_section_header("GPS"))
+        
+        dms_layout = QHBoxLayout()
+        dms_label = QLabel("Show DMS Decimals:")
+        dms_label.setStyleSheet("font-size: 12px; color: #333;")
+        dms_layout.addWidget(dms_label)
+        self.dms_checkbox = QCheckBox()
+        self.dms_checkbox.setChecked(
+            self.config.getboolean('gps', 'show_dms_decimals', fallback=False))
+        self.dms_checkbox.stateChanged.connect(self.save_config)
+        self.dms_checkbox.setStyleSheet("QCheckBox { min-height: 20px; }")
+        dms_layout.addWidget(self.dms_checkbox)
+        dms_layout.addStretch()
+        scroll_layout.addLayout(dms_layout)
+        
+        # Font size slider
+        font_layout = QHBoxLayout()
+        font_label = QLabel("Coordinate Font Size:")
+        font_label.setStyleSheet("font-size: 12px; color: #333; min-width: 150px;")
+        font_layout.addWidget(font_label)
+        
+        self.font_size_slider = QSlider(Qt.Horizontal)
+        self.font_size_slider.setMinimum(60)
+        self.font_size_slider.setMaximum(120)
+        
+        # Load saved font size (default: 65)
+        try:
+            font_size = int(self.config.get('gps', 'coord_font_size', fallback='65'))
+            self.font_size_slider.setValue(font_size)
+        except:
+            self.font_size_slider.setValue(65)
+        
+        self.font_size_slider.setStyleSheet("""
+            QSlider::groove:horizontal {
+                border: 1px solid #ccc;
+                height: 8px;
+                background: #e0e0e0;
+                border-radius: 4px;
+            }
+            QSlider::handle:horizontal {
+                background: #2196F3;
+                border: 1px solid #1976D2;
+                width: 16px;
+                margin: -4px 0;
+                border-radius: 8px;
+            }
+        """)
+        self.font_size_slider.valueChanged.connect(self.save_config)
+        font_layout.addWidget(self.font_size_slider)
+        
+        # Display current value
+        self.font_size_value = QLabel(str(self.font_size_slider.value()))
+        self.font_size_value.setStyleSheet("font-size: 12px; color: #333; min-width: 30px;")
+        self.font_size_slider.valueChanged.connect(lambda v: self.font_size_value.setText(str(v)))
+        font_layout.addWidget(self.font_size_value)
+        font_layout.addStretch()
+        scroll_layout.addLayout(font_layout)
+        
+        # Coordinate color selector
+        color_layout = QHBoxLayout()
+        color_label = QLabel("Coordinate Color:")
+        color_label.setStyleSheet("font-size: 12px; color: #333; min-width: 150px;")
+        color_layout.addWidget(color_label)
+        
+        # Load saved color (default: lime)
+        saved_coord_color = self.config.get('gps', 'coord_color', fallback='lime')
+        
+        # Color buttons
+        self.coord_color_buttons = {}
+        colors = {
+            'yellow': '#FFFF00',
+            'white': '#FFFFFF',
+            'cyan': '#00FFFF',
+            'lime': '#00FF00',
+            'red': '#FF0000',
+            'orange': '#FFA500',
+        }
+        
+        for color_name, color_hex in colors.items():
+            btn = QPushButton(color_name.upper())
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {color_hex};
+                    color: {'#000000' if color_name in ['yellow', 'white', 'cyan', 'lime'] else '#FFFFFF'};
+                    font-size: 11px;
+                    font-weight: bold;
+                    padding: 8px 12px;
+                    border: 2px solid {'#000000' if saved_coord_color == color_name else '#ccc'};
+                    border-radius: 4px;
+                    min-width: 60px;
+                }}
+                QPushButton:pressed {{
+                    border: 3px solid #333;
+                }}
+            """)
+            btn.clicked.connect(lambda checked, c=color_name: self.set_coord_color(c))
+            self.coord_color_buttons[color_name] = btn
+            color_layout.addWidget(btn)
+        
+        self.selected_coord_color = saved_coord_color
+        color_layout.addStretch()
+        scroll_layout.addLayout(color_layout)
+        
+        scroll_layout.addSpacing(10)
+        
+        # Metadata (Time, Quality, Satellites) controls
+        scroll_layout.addWidget(QLabel("Metadata:").setStyleSheet("font-size: 12px; color: #333;"))
+        
+        # Metadata font size slider
+        meta_font_layout = QHBoxLayout()
+        meta_font_label = QLabel("Font Size:")
+        meta_font_label.setStyleSheet("font-size: 12px; color: #333; min-width: 150px;")
+        meta_font_layout.addWidget(meta_font_label)
+        
+        self.meta_font_size_slider = QSlider(Qt.Horizontal)
+        self.meta_font_size_slider.setMinimum(8)
+        self.meta_font_size_slider.setMaximum(48)
+        
+        # Load saved metadata font size (default: 12)
+        try:
+            meta_font_size = int(self.config.get('gps', 'meta_font_size', fallback='12'))
+            self.meta_font_size_slider.setValue(meta_font_size)
+        except:
+            self.meta_font_size_slider.setValue(12)
+        
+        self.meta_font_size_slider.setStyleSheet("""
+            QSlider::groove:horizontal {
+                border: 1px solid #ccc;
+                height: 8px;
+                background: #e0e0e0;
+                border-radius: 4px;
+            }
+            QSlider::handle:horizontal {
+                background: #2196F3;
+                border: 1px solid #1976D2;
+                width: 16px;
+                margin: -4px 0;
+                border-radius: 8px;
+            }
+        """)
+        self.meta_font_size_slider.valueChanged.connect(self.save_config)
+        meta_font_layout.addWidget(self.meta_font_size_slider)
+        
+        # Display current value
+        self.meta_font_size_value = QLabel(str(self.meta_font_size_slider.value()))
+        self.meta_font_size_value.setStyleSheet("font-size: 12px; color: #333; min-width: 30px;")
+        self.meta_font_size_slider.valueChanged.connect(lambda v: self.meta_font_size_value.setText(str(v)))
+        meta_font_layout.addWidget(self.meta_font_size_value)
+        meta_font_layout.addStretch()
+        scroll_layout.addLayout(meta_font_layout)
+        
+        # Metadata color selector
+        meta_color_layout = QHBoxLayout()
+        meta_color_label = QLabel("Color:")
+        meta_color_label.setStyleSheet("font-size: 12px; color: #333; min-width: 150px;")
+        meta_color_layout.addWidget(meta_color_label)
+        
+        # Load saved metadata color (default: white)
+        saved_meta_color = self.config.get('gps', 'meta_color', fallback='white')
+        
+        # Color buttons
+        self.meta_color_buttons = {}
+        
+        for color_name, color_hex in colors.items():
+            btn = QPushButton(color_name.upper())
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {color_hex};
+                    color: {'#000000' if color_name in ['yellow', 'white', 'cyan', 'lime'] else '#FFFFFF'};
+                    font-size: 11px;
+                    font-weight: bold;
+                    padding: 8px 12px;
+                    border: 2px solid {'#000000' if saved_meta_color == color_name else '#ccc'};
+                    border-radius: 4px;
+                    min-width: 60px;
+                }}
+                QPushButton:pressed {{
+                    border: 3px solid #333;
+                }}
+            """)
+            btn.clicked.connect(lambda checked, c=color_name: self.set_meta_color(c))
+            self.meta_color_buttons[color_name] = btn
+            meta_color_layout.addWidget(btn)
+        
+        self.selected_meta_color = saved_meta_color
+        meta_color_layout.addStretch()
+        scroll_layout.addLayout(meta_color_layout)
+        
+        scroll_layout.addSpacing(10)
+        
+        # ─── CAMERA SECTION ───
+        scroll_layout.addWidget(self._create_section_header("Camera"))
+        
+        # Get cameras
+        cameras = cam_discovery.get_cameras()
+        self.camera_combos = {}
+        
+        if cameras:
+            scroll_layout.addWidget(QLabel("Camera Rotation:").setStyleSheet("font-size: 12px; color: #333;") or QLabel("Camera Rotation:"))
+            
+            for cam_name in sorted(cameras.keys()):
+                cam_layout = QHBoxLayout()
+                cam_label = QLabel(cam_name)
+                cam_label.setStyleSheet("font-size: 11px; color: #555; min-width: 150px;")
+                cam_layout.addWidget(cam_label)
+                
+                combo = QComboBox()
+                combo.addItems(['0°', '90°', '180°', '270°'])
+                combo.setStyleSheet("""
+                    QComboBox {
+                        font-size: 12px;
+                        padding: 5px;
+                        min-width: 80px;
+                        border: 1px solid #ccc;
+                        border-radius: 3px;
+                    }
+                """)
+                
+                # Load saved rotation
+                try:
+                    if not self.config.has_section('camera_rotations'):
+                        self.config.add_section('camera_rotations')
+                    rotation = int(self.config.get('camera_rotations', cam_name, fallback='0'))
+                    combo.setCurrentIndex(rotation // 90)
+                except:
+                    combo.setCurrentIndex(0)
+                
+                combo.currentIndexChanged.connect(self.save_config)
+                self.camera_combos[cam_name] = combo
+                cam_layout.addWidget(combo)
+                cam_layout.addStretch()
+                scroll_layout.addLayout(cam_layout)
+        else:
+            scroll_layout.addWidget(QLabel("No cameras found"))
+        
+        scroll_layout.addSpacing(10)
+        
+        # ─── MAP SECTION ───
+        scroll_layout.addWidget(self._create_section_header("Map"))
+        map_label = QLabel("(No settings available)")
+        map_label.setStyleSheet("font-size: 12px; color: #999;")
+        scroll_layout.addWidget(map_label)
+        
+        scroll_layout.addStretch()
+        scroll_widget.setLayout(scroll_layout)
+        scroll.setWidget(scroll_widget)
+        
+        layout.addWidget(scroll)
+        
+        self.setLayout(layout)
+    
+    def _create_section_header(self, text):
+        """Create a section header label with professional styling"""
+        label = QLabel(text)
+        label.setStyleSheet("""
+            font-weight: bold;
+            font-size: 14px;
+            color: white;
+            background-color: #1976D2;
+            padding: 10px 8px;
+            border-radius: 3px;
+            margin-top: 5px;
+        """)
+        label.setMinimumHeight(35)
+        return label
+    
+    def _create_bordered_box(self, title):
+        """Create a bordered box container with title"""
+        container = QWidget()
+        container.setStyleSheet(f"""
+            QWidget {{
+                border: 1px solid #ccc;
+                border-radius: 4px;
+                background-color: #fafafa;
+                margin-top: 15px;
+            }}
+        """)
+        
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        
+        # Title label (positioned at top-left border)
+        title_label = QLabel(f"  {title}  ")
+        title_label.setStyleSheet("""
+            background-color: #f5f5f5;
+            color: #333;
+            font-size: 11px;
+            font-weight: bold;
+            padding: 2px 4px;
+            margin: -8px 10px 0px 10px;
+        """)
+        layout.addWidget(title_label, alignment=Qt.AlignTop)
+        
+        # Content area
+        self._current_box_content = QVBoxLayout()
+        self._current_box_content.setContentsMargins(15, 10, 15, 10)
+        self._current_box_content.setSpacing(12)
+        
+        layout.addLayout(self._current_box_content)
+        container.setLayout(layout)
+        
+        return container, self._current_box_content
+    
+    def set_coord_color(self, color_name):
+        """Set coordinate color and update button styling"""
+        self.selected_coord_color = color_name
+        
+        # Update button styling
+        colors = {
+            'yellow': '#FFFF00',
+            'white': '#FFFFFF',
+            'cyan': '#00FFFF',
+            'lime': '#00FF00',
+            'red': '#FF0000',
+            'orange': '#FFA500',
+        }
+        
+        for name, btn in self.coord_color_buttons.items():
+            color_hex = colors[name]
+            text_color = '#000000' if name in ['yellow', 'white', 'cyan', 'lime'] else '#FFFFFF'
+            border = '#000000' if name == color_name else '#ccc'
+            border_width = '3px' if name == color_name else '2px'
+            
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {color_hex};
+                    color: {text_color};
+                    font-size: 11px;
+                    font-weight: bold;
+                    padding: 8px 12px;
+                    border: {border_width} solid {border};
+                    border-radius: 4px;
+                    min-width: 60px;
+                }}
+                QPushButton:pressed {{
+                    border: 3px solid #333;
+                }}
+            """)
+        
+        self.save_config()
+    
+    def set_meta_color(self, color_name):
+        """Set metadata color and update button styling"""
+        self.selected_meta_color = color_name
+        
+        # Update button styling
+        colors = {
+            'yellow': '#FFFF00',
+            'white': '#FFFFFF',
+            'cyan': '#00FFFF',
+            'lime': '#00FF00',
+            'red': '#FF0000',
+            'orange': '#FFA500',
+        }
+        
+        for name, btn in self.meta_color_buttons.items():
+            color_hex = colors[name]
+            text_color = '#000000' if name in ['yellow', 'white', 'cyan', 'lime'] else '#FFFFFF'
+            border = '#000000' if name == color_name else '#ccc'
+            border_width = '3px' if name == color_name else '2px'
+            
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {color_hex};
+                    color: {text_color};
+                    font-size: 11px;
+                    font-weight: bold;
+                    padding: 8px 12px;
+                    border: {border_width} solid {border};
+                    border-radius: 4px;
+                    min-width: 60px;
+                }}
+                QPushButton:pressed {{
+                    border: 3px solid #333;
+                }}
+            """)
+        
+        self.save_config()
+    
+    def save_config(self):
+        """Save configuration to file (called on every change)"""
+        # DMS decimals
+        self.config.set('gps', 'show_dms_decimals', str(self.dms_checkbox.isChecked()))
+        gps_core.SHOW_DMS_DECIMALS = self.dms_checkbox.isChecked()
+        
+        # Coordinate font size
+        self.config.set('gps', 'coord_font_size', str(self.font_size_slider.value()))
+        
+        # Coordinate color
+        self.config.set('gps', 'coord_color', self.selected_coord_color)
+        
+        # Metadata font size
+        self.config.set('gps', 'meta_font_size', str(self.meta_font_size_slider.value()))
+        
+        # Metadata color
+        self.config.set('gps', 'meta_color', self.selected_meta_color)
+        
+        # Per-camera rotations
+        if not self.config.has_section('camera_rotations'):
+            self.config.add_section('camera_rotations')
+        
+        for cam_name, combo in self.camera_combos.items():
+            rotation = combo.currentIndex() * 90
+            self.config.set('camera_rotations', cam_name, str(rotation))
+        
+        # Write config file
+        config_file = os.path.expanduser("~/Projects/seeboard/see_board.cfg")
+        with open(config_file, 'w') as f:
+            self.config.write(f)
+        print(f"[CONF] Config auto-saved")
+
+
+class SeeBoardApp(QMainWindow):
+    """Main Application"""
+    
+    def __init__(self):
+        super().__init__()
+        
+        # Load config
+        config_file = os.path.expanduser("~/Projects/seeboard/see_board.cfg")
+        self.config = ConfigParser()
+        self.config.read(config_file)
+        
+        for section in ['gps', 'coords', 'route_recording', 'camera_rotations', 'cam']:
+            if not self.config.has_section(section):
+                self.config.add_section(section)
+        
+        self.setWindowTitle("seeBoard - GPS & Camera Dashboard")
+        self.setGeometry(100, 100, 800, 600)
+        
+        # Create tabs
+        self.tabs = QTabWidget()
+        self.coords_tab = CoordsTab(self.config)
+        self.map_tab = MapTab(self.config)
+        self.cam_tab = CamTab(self.config)
+        self.conf_tab = ConfTab(self.config)
+        
+        self.tabs.addTab(self.coords_tab, "COORDS")
+        self.tabs.addTab(self.map_tab, "MAP")
+        self.tabs.addTab(self.cam_tab, "CAM")
+        self.tabs.addTab(self.conf_tab, "CONF")
+        
+        # Connect tab change signal
+        self.tabs.currentChanged.connect(self.on_tab_changed)
+        
+        self.setCentralWidget(self.tabs)
+        
+        # Start backend services
+        print("[APP] Starting backend services...")
+        gps_core.start_background_reader()
+        cam_discovery.start()
+        start_new_cameras()
+    
+    def on_tab_changed(self, index):
+        """Handle tab change - refresh settings on visible tabs"""
+        current_tab = self.tabs.currentWidget()
+        if hasattr(current_tab, 'on_tab_shown'):
+            current_tab.on_tab_shown()
+    
+    def closeEvent(self, event):
+        print("[APP] Shutting down...")
+        stop_all_cameras()
+        try:
+            gps_core.stop_background_reader()
+        except:
+            pass
+        try:
+            cam_discovery.stop()
+        except:
+            pass
+        try:
+            self.coords_tab.gps_worker.stop()
+            self.coords_tab.gps_worker.wait(1000)
+        except:
+            pass
+        print("[APP] Shutdown complete")
+        event.accept()
+
+
+def main():
+    init_route_recorder()
+    app = QApplication(sys.argv)
+    window = SeeBoardApp()
+    window.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == '__main__':
+    main()

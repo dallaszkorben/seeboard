@@ -105,16 +105,16 @@ def read_gps_remote():
                         'lon_raw': data.get('lng'),
                         'lon_dir': 'E' if data.get('lng', 0) >= 0 else 'W',
                         'quality': QUALITY_NAMES[min(1, 3)],  # GPS fix
-                        'sats_used': str(data.get('satellites', 0)),
-                        'sats_visible': str(data.get('satellites', 0)),
+                        'sats_used': data.get('satellites', 0),
+                        'sats_visible': data.get('sats_visible', data.get('satellites', 0)),
                     }
                 else:
                     # No fix yet
                     return {
                         'status': 'no_fix',
                         'time': data.get('time', '--:--:--'),
-                        'sats_used': str(data.get('satellites', 0)),
-                        'sats_visible': str(data.get('satellites', 0)),
+                        'sats_used': data.get('satellites', 0),
+                        'sats_visible': data.get('sats_visible', data.get('satellites', 0)),
                     }
             
             elif response.status_code == 503:
@@ -122,8 +122,8 @@ def read_gps_remote():
                 return {
                     'status': 'no_fix',
                     'time': '--:--:--',
-                    'sats_used': '0',
-                    'sats_visible': '0',
+                    'sats_used': 0,
+                    'sats_visible': 0,
                 }
         except Exception:
             # This host failed, try next one

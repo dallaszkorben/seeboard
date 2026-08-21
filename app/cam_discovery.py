@@ -7,8 +7,14 @@ This module discovers them and provides their stream URLs.
 
 import threading
 import time
-from zeroconf import ServiceBrowser, Zeroconf, ServiceStateChange
 import socket
+
+try:
+    from zeroconf import ServiceBrowser, Zeroconf, ServiceStateChange
+    HAS_ZEROCONF = True
+except ImportError:
+    HAS_ZEROCONF = False
+    print("[CAM_DISCOVERY] Warning: zeroconf not available, camera discovery disabled")
 
 SERVICE_TYPE = "_mjpeg._tcp.local."
 
@@ -23,9 +29,12 @@ def _on_service_state_change(zeroconf, service_type, name, state_change):
     if state_change == ServiceStateChange.Added:
         info = zeroconf.get_service_info(service_type, name)
         if info:
-            ip = socket.inet_ntoa(info.addresses[0])
+            # Use hostname instead of IP so we can match camera names in config
+            # name is like "esp32-cam-f404._mjpeg._tcp.local."
+            # We want to extract "esp32-cam-f404" and use "esp32-cam-f404.local"
+            hostname = name.split('.')[0]  # "esp32-cam-f404"
             port = info.port
-            url = f"http://{ip}:{port}/stream"
+            url = f"http://{hostname}.local:{port}/stream"
             with _lock:
                 _cameras[name] = url
 
@@ -36,6 +45,10 @@ def _on_service_state_change(zeroconf, service_type, name, state_change):
 
 def start():
     """Start discovering cameras on the network."""
+    if not HAS_ZEROCONF:
+        print("[CAM_DISCOVERY] Skipping - zeroconf not available")
+        return
+    
     global _zeroconf, _browser
     _zeroconf = Zeroconf()
     _browser = ServiceBrowser(_zeroconf, SERVICE_TYPE, handlers=[_on_service_state_change])

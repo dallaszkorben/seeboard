@@ -31,6 +31,7 @@ def create(parent, fonts, config, config_file):
     qual_var = tk.StringVar(value="Quality: -")
     sat_var = tk.StringVar(value="Satellites: - used / - visible")
     status_var = tk.StringVar(value="")
+    recording_var = tk.StringVar(value="")
 
     # Large text for coordinates — color changes based on fix status.
     # Color is configurable via CONF menu (stored in see_board.cfg).
@@ -46,6 +47,12 @@ def create(parent, fonts, config, config_file):
              fg='white', bg='black').pack(pady=5)
     tk.Label(frame, textvariable=sat_var, font=fonts["FONT_INFO"],
              fg='white', bg='black').pack(pady=5)
+    
+    # Recording status label — RED when recording, invisible when not
+    recording_label = tk.Label(frame, textvariable=recording_var, font=fonts["FONT_INFO"],
+                               fg='red', bg='black')
+    recording_label.pack(pady=5)
+    
     # Error/warning label — color read from config each time it's updated
     status_label = tk.Label(frame, textvariable=status_var, font=fonts["FONT_STATUS"],
                             fg='red', bg='black')
@@ -67,7 +74,7 @@ def create(parent, fonts, config, config_file):
         gps_core.SHOW_DMS_DECIMALS = config.getboolean(
             'gps', 'show_dms_decimals', fallback=False)
 
-    def update_gps(root, get_view_mode, marker, map_widget):
+    def update_gps(root, get_view_mode, marker, map_widget, route_recorder=None):
         """Display latest GPS data. Non-blocking — reads from background thread."""
         data = get_latest()
 
@@ -115,7 +122,13 @@ def create(parent, fonts, config, config_file):
                 last_pos[0] = lat
                 last_pos[1] = lon
 
-        # Poll every 500ms — background thread handles actual serial reading
-        root.after(500, lambda: update_gps(root, get_view_mode, marker, map_widget))
+        # Update recording status display
+        if route_recorder and route_recorder.is_recording():
+            route_info = route_recorder.get_recording_info()
+            if route_info:
+                point_count = route_info.get('point_count', 0)
+                recording_var.set(f"🔴 RECORDING ({point_count} pts)")
+        else:
+            recording_var.set("")
 
     return frame, update_gps, on_show
