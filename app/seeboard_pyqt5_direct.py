@@ -35,9 +35,10 @@ import gps_core
 import cam_discovery
 import map_generator
 import route_recorder as route_recorder_module
-from route_database import RouteDatabase
+from route_database import PathDatabase
 from route_recorder import RouteRecorder
 from map_renderer import MapRenderer, MapCache
+from config_loader import ConfigLoader
 
 # Global route recorder
 _db = None
@@ -45,8 +46,126 @@ global_route_recorder = None
 
 def init_route_recorder():
     global _db, global_route_recorder
-    _db = RouteDatabase()
+    _db = PathDatabase()
     global_route_recorder = RouteRecorder(_db)
+
+
+def create_styled_button(text, bg_color_hex, text_color, state='active', width=None, height=None):
+    """
+    Create a styled button with consistent appearance across the app
+    
+    Args:
+        text: Button text
+        bg_color_hex: Background color in hex format (#RRGGBB)
+        text_color: Text color (name or hex)
+        state: Button state - 'active' (enabled, clickable), 'selected' (active with highlight), or 'inactive' (disabled, grey)
+        width: Optional fixed width in pixels
+        height: Optional fixed height in pixels
+    
+    Returns:
+        QPushButton with applied stylesheet
+    """
+    btn = QPushButton(text)
+    
+    if state == 'active':
+        # Active state: enabled, bright color, no special border
+        stylesheet = f"""
+            QPushButton {{
+                background-color: {bg_color_hex};
+                color: {text_color};
+                font-size: 12px;
+                font-weight: bold;
+                padding: 10px 15px;
+                border: 2px solid #ddd;
+                border-radius: 6px;
+            }}
+            QPushButton:hover {{
+                border: 2px solid #007AFF;
+                background-color: {bg_color_hex};
+            }}
+            QPushButton:pressed {{
+                border: 2px solid #0051d5;
+                background-color: {_darken_color(bg_color_hex, 20)};
+            }}
+        """
+        btn.setEnabled(True)
+    
+    elif state == 'selected':
+        # Selected state: enabled, bright color, blue border to show it's selected
+        hover_color = _lighten_color(bg_color_hex, 15)
+        pressed_color = _darken_color(bg_color_hex, 25)
+        stylesheet = f"""
+            QPushButton {{
+                background-color: {bg_color_hex};
+                color: {text_color};
+                font-size: 12px;
+                font-weight: bold;
+                padding: 10px 15px;
+                border: 4px solid #007AFF;
+                border-radius: 6px;
+            }}
+            QPushButton:hover {{
+                border: 4px solid #0051d5;
+                background-color: {hover_color};
+            }}
+            QPushButton:pressed {{
+                border: 4px solid #003d9e;
+                background-color: {pressed_color};
+            }}
+        """
+        btn.setEnabled(True)
+    
+    elif state == 'inactive':
+        # Inactive state: disabled, grey color
+        stylesheet = """
+            QPushButton {
+                background-color: #999999;
+                color: #666666;
+                font-size: 12px;
+                font-weight: bold;
+                padding: 10px 15px;
+                border: 2px solid #777777;
+                border-radius: 6px;
+            }
+            QPushButton:hover {
+                background-color: #999999;
+                border: 2px solid #777777;
+            }
+            QPushButton:pressed {
+                background-color: #999999;
+                border: 2px solid #777777;
+            }
+        """
+        btn.setEnabled(False)
+    
+    btn.setStyleSheet(stylesheet)
+    
+    if width is not None and height is not None:
+        btn.setFixedSize(width, height)
+    elif width is not None:
+        btn.setMinimumWidth(width)
+    elif height is not None:
+        btn.setFixedHeight(height)
+    
+    return btn
+
+
+def _lighten_color(hex_color, amount):
+    """Lighten a hex color by the given amount"""
+    hex_color = hex_color.lstrip('#')
+    r = min(255, int(hex_color[0:2], 16) + amount)
+    g = min(255, int(hex_color[2:4], 16) + amount)
+    b = min(255, int(hex_color[4:6], 16) + amount)
+    return f'#{r:02x}{g:02x}{b:02x}'
+
+
+def _darken_color(hex_color, amount):
+    """Darken a hex color by the given amount"""
+    hex_color = hex_color.lstrip('#')
+    r = max(0, int(hex_color[0:2], 16) - amount)
+    g = max(0, int(hex_color[2:4], 16) - amount)
+    b = max(0, int(hex_color[4:6], 16) - amount)
+    return f'#{r:02x}{g:02x}{b:02x}'
 
 # ─── GLOBAL SLIDER STYLESHEET ───
 SLIDER_STYLESHEET = """
@@ -320,23 +439,16 @@ class CoordsTab(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         
-        # Load background color
-        try:
-            brightness = int(self.config.get('coords', 'bg_brightness', fallback='0'))
-            color_name = self.config.get('coords', 'bg_color', fallback='black')
-        except:
-            brightness = 0
-            color_name = 'black'
+        # Load background color using centralized config loader
+        brightness = self.config.get_int('coords', 'bg_brightness', default=0)
+        color_name = self.config.get_str('coords', 'bg_color', default='black')
         
-        # Ensure coords section exists in config
-        if not self.config.has_section('coords'):
-            self.config.add_section('coords')
-        
-        # Save defaults if not present
-        if not self.config.has_option('coords', 'bg_color'):
-            self.config.set('coords', 'bg_color', color_name)
-        if not self.config.has_option('coords', 'bg_brightness'):
-            self.config.set('coords', 'bg_brightness', str(brightness))
+        # Ensure coords section exists and save defaults if not present
+        self.config.ensure_section('coords')
+        if brightness == 0:
+            self.config.set_value('coords', 'bg_brightness', 0)
+        if color_name == 'black':
+            self.config.set_value('coords', 'bg_color', color_name)
         
         bg_colors = {
             'black': (0, 0, 40),
@@ -362,14 +474,16 @@ class CoordsTab(QWidget):
         self.setPalette(palette)
         self.setAutoFillBackground(True)
         
-        # ─── NORTH SECTION: COORDINATES ───
-        north_layout = QVBoxLayout()
-        north_layout.setContentsMargins(20, 20, 20, 20)
-        north_layout.setSpacing(0)
+        # ─── COORDINATES CONTAINER (lat/lon together) ───
+        coords_container = QWidget()
+        coords_layout = QVBoxLayout()
+        coords_layout.setContentsMargins(0, 0, 0, 0)
+        coords_layout.setSpacing(-5)
+        coords_layout.addStretch()  # Add space before
         
         try:
-            coord_font_size = int(self.config.get('gps', 'coord_font_size', fallback='65'))
-            color_name = self.config.get('gps', 'coord_color', fallback='lime')
+            coord_font_size = self.config.get_int('gps', 'coord_font_size', default=65)
+            color_name = self.config.get_str('gps', 'coord_color', default='lime')
             color_map = {
                 'yellow': '#FFFF00',
                 'white': '#FFFFFF',
@@ -385,30 +499,29 @@ class CoordsTab(QWidget):
         
         self.lat_label = QLabel("--°--'--\"")
         self.lat_label.setFont(QFont("Helvetica", coord_font_size, QFont.Bold))
-        self.lat_label.setStyleSheet(f"color: {color_hex}; background-color: transparent;")
+        self.lat_label.setStyleSheet(f"color: {color_hex}; background-color: transparent; margin: 0px; padding: 0px;")
         self.lat_label.setAlignment(Qt.AlignCenter)
-        north_layout.addWidget(self.lat_label)
+        coords_layout.addWidget(self.lat_label)
         
         self.lon_label = QLabel("---°--'--\"")
         self.lon_label.setFont(QFont("Helvetica", coord_font_size, QFont.Bold))
-        self.lon_label.setStyleSheet(f"color: {color_hex}; background-color: transparent;")
+        self.lon_label.setStyleSheet(f"color: {color_hex}; background-color: transparent; margin: 0px; padding: 0px;")
         self.lon_label.setAlignment(Qt.AlignCenter)
-        north_layout.addWidget(self.lon_label)
+        coords_layout.addWidget(self.lon_label)
         
-        layout.addLayout(north_layout, 1)  # Stretch top
+        coords_layout.addStretch()  # Add space after
+        coords_container.setLayout(coords_layout)
+        layout.addWidget(coords_container, 1)  # Stretch top
         
-        # ─── SOUTH SECTION: METADATA ───
+        # ─── METADATA CONTAINER (time, quality, satellites) ───
+        metadata_container = QWidget()
         south_layout = QVBoxLayout()
         south_layout.setContentsMargins(10, 5, 10, 5)
         south_layout.setSpacing(2)
         
-        try:
-            meta_font_size = int(self.config.get('gps', 'meta_font_size', fallback='12'))
-            meta_color_name = self.config.get('gps', 'meta_color', fallback='white')
-            meta_color_hex = color_map.get(meta_color_name, '#FFFFFF')
-        except:
-            meta_font_size = 12
-            meta_color_hex = '#FFFFFF'
+        meta_font_size = self.config.get_int('gps', 'meta_font_size', default=12)
+        meta_color_name = self.config.get_str('gps', 'meta_color', default='white')
+        meta_color_hex = color_map.get(meta_color_name, '#FFFFFF')
         
         self.time_label = QLabel("Time: --:--:--")
         self.time_label.setFont(QFont("Helvetica", meta_font_size))
@@ -440,33 +553,27 @@ class CoordsTab(QWidget):
         self.status_label.setAlignment(Qt.AlignCenter)
         south_layout.addWidget(self.status_label)
         
-        layout.addLayout(south_layout, 0)  # No stretch bottom
+        metadata_container.setLayout(south_layout)
+        layout.addWidget(metadata_container, 0)  # No stretch bottom
         
         self.setLayout(layout)
     
     def on_tab_shown(self):
         """Called when this tab becomes visible - reload config"""
-        try:
-            gps_core.SHOW_DMS_DECIMALS = self.config.getboolean('gps', 'show_dms_decimals', fallback=False)
-        except:
-            gps_core.SHOW_DMS_DECIMALS = False
+        gps_core.SHOW_DMS_DECIMALS = self.config.get_bool('gps', 'show_dms_decimals', default=False)
         
         # Reload coordinates font and color
-        try:
-            font_size = int(self.config.get('gps', 'coord_font_size', fallback='65'))
-            color_name = self.config.get('gps', 'coord_color', fallback='lime')
-            color_map = {
-                'yellow': '#FFFF00',
-                'white': '#FFFFFF',
-                'cyan': '#00FFFF',
-                'lime': '#00FF00',
-                'red': '#FF0000',
-                'orange': '#FFA500',
-            }
-            color_hex = color_map.get(color_name, '#00FF00')
-        except:
-            font_size = 65
-            color_hex = '#00FF00'
+        font_size = self.config.get_int('gps', 'coord_font_size', default=65)
+        color_name = self.config.get_str('gps', 'coord_color', default='lime')
+        color_map = {
+            'yellow': '#FFFF00',
+            'white': '#FFFFFF',
+            'cyan': '#00FFFF',
+            'lime': '#00FF00',
+            'red': '#FF0000',
+            'orange': '#FFA500',
+        }
+        color_hex = color_map.get(color_name, '#00FF00')
         
         self.lat_label.setFont(QFont("Helvetica", font_size, QFont.Bold))
         self.lon_label.setFont(QFont("Helvetica", font_size, QFont.Bold))
@@ -474,13 +581,9 @@ class CoordsTab(QWidget):
         self.lon_label.setStyleSheet(f"color: {color_hex}; background-color: transparent;")
         
         # Reload metadata font and color
-        try:
-            meta_font_size = int(self.config.get('gps', 'meta_font_size', fallback='12'))
-            meta_color_name = self.config.get('gps', 'meta_color', fallback='white')
-            meta_color_hex = color_map.get(meta_color_name, '#FFFFFF')
-        except:
-            meta_font_size = 12
-            meta_color_hex = '#FFFFFF'
+        meta_font_size = self.config.get_int('gps', 'meta_font_size', default=12)
+        meta_color_name = self.config.get_str('gps', 'meta_color', default='white')
+        meta_color_hex = color_map.get(meta_color_name, '#FFFFFF')
         
         self.time_label.setFont(QFont("Helvetica", meta_font_size))
         self.qual_label.setFont(QFont("Helvetica", meta_font_size))
@@ -492,12 +595,8 @@ class CoordsTab(QWidget):
         self.sat_label.setStyleSheet(f"color: {meta_color_hex}; background-color: transparent;")
         
         # Reload background color - PALETTE METHOD (strongest)
-        try:
-            brightness = int(self.config.get('coords', 'bg_brightness', fallback='0'))
-            color_name = self.config.get('coords', 'bg_color', fallback='black')
-        except:
-            brightness = 0
-            color_name = 'black'
+        brightness = self.config.get_int('coords', 'bg_brightness', default=0)
+        color_name = self.config.get_str('coords', 'bg_color', default='black')
         
         bg_colors = {
             'black': (0, 0, 40),
@@ -523,7 +622,7 @@ class CoordsTab(QWidget):
     def update_gps(self, data):
         # Get the configured coordinate color
         try:
-            color_name = self.config.get('gps', 'coord_color', fallback='lime')
+            color_name = self.config.get_str('gps', 'coord_color', default='lime')
             color_map = {
                 'yellow': '#FFFF00',
                 'white': '#FFFFFF',
@@ -647,6 +746,18 @@ class MapTab(QWidget):
         self.map_center_lon = self.current_lon
         self.needs_render = True  # Flag to trigger render
         
+        # Recording state
+        self.is_recording = False
+        self.current_recording_path_id = None
+        self.current_recording_color = None
+        self.map_mode = "FREE"  # FREE or FOLLOW
+        
+        # Initialize route recorder
+        from route_database import PathDatabase
+        from route_recorder import RouteRecorder
+        self.db = PathDatabase()
+        self.recorder = RouteRecorder(self.db)
+        
         # Mouse tracking for pan
         self.last_mouse_pos = None
         self.pan_active = False
@@ -688,11 +799,29 @@ class MapTab(QWidget):
         button_layout.addWidget(center_btn)
         
         layout.addLayout(button_layout, 0)  # No stretch
+        
+        # Recording buttons
+        rec_button_layout = QHBoxLayout()
+        rec_button_layout.setContentsMargins(5, 5, 5, 5)
+        rec_button_layout.setSpacing(5)
+        
+        # REC button: Green, active state
+        self.rec_btn = create_styled_button("REC", "#00CC00", "white", state='active')
+        self.rec_btn.clicked.connect(self.start_recording)
+        rec_button_layout.addWidget(self.rec_btn, 1)  # Stretch factor = 1
+        
+        # STOP button: Red, inactive state (until recording starts)
+        self.stop_btn = create_styled_button("STOP", "#FF4444", "white", state='inactive')
+        self.stop_btn.clicked.connect(self.stop_recording)
+        rec_button_layout.addWidget(self.stop_btn, 1)  # Stretch factor = 1
+        
+        layout.addLayout(rec_button_layout, 0)  # No stretch
         self.setLayout(layout)
         
         # Timer for render updates (only on demand)
         self.update_timer = QTimer()
         self.update_timer.timeout.connect(self.render_if_needed)
+        self.update_timer.timeout.connect(self.record_gps_point_if_needed)
         self.update_timer.start(500)  # Check every 500ms if render needed
         
         # Connect GPS updates (just update position, don't render)
@@ -715,13 +844,16 @@ class MapTab(QWidget):
             (self.current_lat != 56.1612 or self.current_lon != 15.5869)):
             self.map_center_lat = self.current_lat
             self.map_center_lon = self.current_lon
-            print(f"[MAP] Initial center set to GPS: {self.current_lat}, {self.current_lon}")
+        
+        # If in FOLLOW mode, center on GPS position
+        if self.map_mode == "FOLLOW":
+            self.map_center_lat = self.current_lat
+            self.map_center_lon = self.current_lon
         
         # If GPS position changed, re-render to update marker position
         if (self.current_lat != old_lat or self.current_lon != old_lon):
             self.needs_render = True
-        # Don't update map_center - stays where user moved it
-        # In FOLLOW mode (future), we would do: self.map_center_lat = self.current_lat
+        # Don't update map_center in FREE mode - stays where user moved it
     
     def render_if_needed(self):
         """Only render if something changed"""
@@ -732,16 +864,25 @@ class MapTab(QWidget):
     def render_map(self):
         """Render map at current map center"""
         try:
-            # Debug: log positions and widget size
-            print(f"[MAP] Rendering at center: {self.map_center_lat}, {self.map_center_lon} (GPS: {self.current_lat}, {self.current_lon})")
-            print(f"[MAP] Label size: {self.map_label.width()}x{self.map_label.height()}")
-            
             # Use label size or default
             width = self.map_label.width() if self.map_label.width() > 100 else 800
             height = self.map_label.height() if self.map_label.height() > 100 else 600
             
             # Create renderer with actual widget dimensions
             renderer = MapRenderer(width=width, height=height)
+            
+            # Get current recording path points if recording
+            route_points = None
+            if self.is_recording and self.current_recording_path_id:
+                current_points = self.recorder.get_current_route_points()
+                if current_points:
+                    route_points = [
+                        (p['latitude'], p['longitude'])
+                        for p in current_points
+                    ]
+            
+            # Get visible paths to display
+            visible_paths = self.get_visible_paths()
             
             # Render map centered on map_center, with GPS position as marker
             pixmap = renderer.render_map(
@@ -750,8 +891,13 @@ class MapTab(QWidget):
                 gps_lat=self.current_lat,
                 gps_lon=self.current_lon,
                 zoom=self.zoom,
-                route_points=None,
-                coverage_radius=None
+                route_points=route_points,
+                coverage_radius=None,
+                path_color=self.current_recording_color or 'RED',
+                position_radius=self.config.get_int('map', 'position_radius', default=2),
+                position_font_size=self.config.get_int('map', 'position_font_size', default=8),
+                path_width=self.config.get_int('map', 'path_width', default=1),
+                visible_paths=visible_paths
             )
             
             if pixmap:
@@ -776,6 +922,60 @@ class MapTab(QWidget):
         if self.zoom > 1:
             self.zoom -= 1
             self.needs_render = True
+    
+    def get_visible_paths(self):
+        """Get list of visible recorded paths from database with their points
+        
+        Returns:
+            List of dicts: [{
+                'path_id': int,
+                'name': str,
+                'color': str,
+                'points': [(lat, lon), ...],
+                'width': int
+            }, ...]
+        """
+        visible_paths = []
+        try:
+            if global_route_recorder and global_route_recorder.db and global_route_recorder.db.connection:
+                cursor = global_route_recorder.db.connection.cursor()
+                
+                # Get all visible paths
+                cursor.execute("""
+                    SELECT path_id, name, color, line_width 
+                    FROM paths 
+                    WHERE is_visible = 1 
+                    ORDER BY created_at DESC
+                """)
+                paths = cursor.fetchall()
+                
+                for path_row in paths:
+                    path_id = path_row[0]
+                    path_name = path_row[1]
+                    path_color = path_row[2] or 'RED'
+                    path_width = path_row[3] or 1
+                    
+                    # Get all points for this path
+                    cursor.execute("""
+                        SELECT latitude, longitude 
+                        FROM path_points 
+                        WHERE path_id = ? 
+                        ORDER BY sequence ASC
+                    """, (path_id,))
+                    points = cursor.fetchall()
+                    
+                    if points:
+                        visible_paths.append({
+                            'path_id': path_id,
+                            'name': path_name,
+                            'color': path_color,
+                            'points': [(p[0], p[1]) for p in points],
+                            'width': path_width
+                        })
+        except Exception as e:
+            print(f"[MAP] Error getting visible paths: {e}")
+        
+        return visible_paths
     
     def center_on_gps(self):
         """Center map on current GPS position"""
@@ -870,6 +1070,91 @@ class MapTab(QWidget):
         
         event.accept()
     
+    def start_recording(self):
+        """Start recording a new path"""
+        if self.is_recording:
+            return
+        
+        # Get recording color from config
+        self.current_recording_color = self.config.get_str('map', 'recording_color', default='RED')
+        
+        # Create recording config
+        recording_config = {
+            'line_color': self.current_recording_color,
+            'line_width': 3,
+            'line_style': 'continuous',
+            'sampling_mode': 'time',  # Use time-based sampling
+            'sampling_value': float(self.config.get_str('map', 'time_based_sampling', default='15s').rstrip('s'))
+        }
+        
+        # Start recording
+        self.current_recording_path_id = self.recorder.start_recording(
+            {
+                'lat': self.current_lat,
+                'lon': self.current_lon,
+                'lat_raw': self.current_lat,
+                'lon_raw': self.current_lon
+            },
+            recording_config
+        )
+        
+        self.is_recording = True
+        self.map_mode = "FOLLOW"
+        
+        # Update button states with new style
+        self._update_recording_button_styles()
+        
+        print(f"[MAP] Recording started: path_id={self.current_recording_path_id}, color={self.current_recording_color}")
+        self.needs_render = True
+    
+    def stop_recording(self):
+        """Stop recording the current path"""
+        if not self.is_recording:
+            return
+        
+        # Stop recorder
+        stopped_id = self.recorder.stop_recording()
+        
+        self.is_recording = False
+        self.map_mode = "FREE"
+        self.current_recording_path_id = None
+        
+        # Update button states with new style
+        self._update_recording_button_styles()
+        
+        print(f"[MAP] Recording stopped: path_id={stopped_id}")
+        self.needs_render = True
+    
+    def _update_recording_button_styles(self):
+        """Update REC/STOP button styles based on recording state"""
+        if self.is_recording:
+            # Recording: REC is inactive (grey), STOP is selected (red with blue border)
+            self.rec_btn.setStyleSheet(create_styled_button("REC", "#00CC00", "white", state='inactive').styleSheet())
+            self.rec_btn.setEnabled(False)
+            
+            self.stop_btn.setStyleSheet(create_styled_button("STOP", "#FF4444", "white", state='selected').styleSheet())
+            self.stop_btn.setEnabled(True)
+        else:
+            # Not recording: REC is active (green), STOP is inactive (grey)
+            self.rec_btn.setStyleSheet(create_styled_button("REC", "#00CC00", "white", state='active').styleSheet())
+            self.rec_btn.setEnabled(True)
+            
+            self.stop_btn.setStyleSheet(create_styled_button("STOP", "#FF4444", "white", state='inactive').styleSheet())
+            self.stop_btn.setEnabled(False)
+    
+    def record_gps_point_if_needed(self):
+        """Check if we should record current GPS point based on sampling criteria"""
+        if not self.is_recording or not self.gps_data:
+            return
+        
+        # Check if we should record this point
+        if self.recorder.should_record_point(self.gps_data):
+            # Record it with full GPS data
+            point_id = self.recorder.add_point(self.gps_data)
+            if point_id:
+                print(f"[MAP] Point recorded: point_id={point_id}")
+                self.needs_render = True
+    
     def closeEvent(self, event):
         """Cleanup on close"""
         self.update_timer.stop()
@@ -902,15 +1187,15 @@ class CamTab(QWidget):
     
     def on_tab_shown(self):
         """Called when CAM tab becomes visible - reload config to get updated rotations"""
-        config_file = os.path.expanduser("~/Projects/seeboard/see_board.cfg")
-        self.config.read(config_file)
+        # Config is automatically persisted by ConfigLoader, no need to reload
+        pass
     
     def update_display(self):
         """Update camera display"""
         try:
             start_new_cameras()
             urls = list(_streams.keys())
-            grace_period = int(self.config.get('camera_settings', 'grace_period_seconds', fallback='5'))
+            grace_period = self.config.get_int('camera_settings', 'grace_period_seconds', default=5)
             
             # Log state
             log_msg = f"[DISPLAY] URLs: {len(urls)}, Expired: {len(self.expired_cameras)}\n"
@@ -988,10 +1273,10 @@ class CamTab(QWidget):
                     
                     # Apply rotation
                     rot = 0
-                    if self.config.has_section('camera_rotations'):
-                        for opt in self.config.options('camera_rotations'):
+                    if self.config.config.has_section('camera_rotations'):
+                        for opt in self.config.config.options('camera_rotations'):
                             if hostname in opt:
-                                rot = self.config.getint('camera_rotations', opt)
+                                rot = self.config.get_int('camera_rotations', opt, default=0)
                     if rot > 0:
                         img = img.rotate(-rot, expand=True)
                     
@@ -1010,8 +1295,8 @@ class CamTab(QWidget):
                 
                 # DRAW TEXT HERE (on frame or placeholder, before any padding)
                 draw = ImageDraw.Draw(img)
-                font_size = int(self.config.get('camera_settings', 'label_font_size', fallback='16'))
-                color_name = self.config.get('camera_settings', 'label_color', fallback='white')
+                font_size = self.config.get_int('camera_settings', 'label_font_size', default=16)
+                color_name = self.config.get_str('camera_settings', 'label_color', default='white')
                 colors = {'white': (255,255,255), 'yellow': (255,255,0), 'cyan': (0,255,255), 'lime': (0,255,0), 'red': (255,0,0)}
                 color = colors.get(color_name, (255,255,255))
                 
@@ -1097,6 +1382,28 @@ class ConfTab(QWidget):
         self.initUI()
     
     def initUI(self):
+        # Common color button stylesheet template
+        def get_button_stylesheet(bg_color_hex, text_color, is_selected):
+            return f"""
+                QPushButton {{
+                    background-color: {bg_color_hex};
+                    color: {text_color};
+                    font-size: 10px;
+                    font-weight: bold;
+                    padding: 8px 12px;
+                    border: {'4px solid #007AFF' if is_selected else '2px solid #ddd'};
+                    border-radius: 6px;
+                    min-width: 50px;
+                }}
+                QPushButton:hover {{
+                    border: 3px solid #007AFF;
+                    background-color: {bg_color_hex};
+                }}
+                QPushButton:pressed {{
+                    border: 4px solid #0051d5;
+                }}
+            """
+        
         layout = QVBoxLayout()
         
         # Create scrollable area
@@ -1162,7 +1469,7 @@ class ConfTab(QWidget):
         dms_layout.addWidget(dms_label)
         self.dms_checkbox = QCheckBox()
         self.dms_checkbox.setChecked(
-            self.config.getboolean('gps', 'show_dms_decimals', fallback=False))
+            self.config.get_bool('gps', 'show_dms_decimals', default=False))
         self.dms_checkbox.stateChanged.connect(self.save_config)
         self.dms_checkbox.setStyleSheet("""
             QCheckBox {
@@ -1205,11 +1512,8 @@ class ConfTab(QWidget):
         self.font_size_slider.setMinimum(60)
         self.font_size_slider.setMaximum(120)
         self.font_size_slider.setStyleSheet(SLIDER_STYLESHEET)
-        try:
-            font_size = int(self.config.get('gps', 'coord_font_size', fallback='65'))
-            self.font_size_slider.setValue(font_size)
-        except:
-            self.font_size_slider.setValue(65)
+        font_size = self.config.get_int('gps', 'coord_font_size', default=65)
+        self.font_size_slider.setValue(font_size)
         
         self.font_size_slider.valueChanged.connect(self.save_config)
         font_layout.addWidget(self.font_size_slider)
@@ -1226,7 +1530,7 @@ class ConfTab(QWidget):
         color_label.setStyleSheet("font-size: 12px; color: #333; min-width: 80px; border: none;")
         color_layout.addWidget(color_label)
         
-        saved_coord_color = self.config.get('gps', 'coord_color', fallback='lime')
+        saved_coord_color = self.config.get_str('gps', 'coord_color', default='lime')
         self.coord_color_buttons = {}
         colors = {
             'yellow': '#FFFF00',
@@ -1241,25 +1545,7 @@ class ConfTab(QWidget):
             btn = QPushButton(color_name.upper())
             text_color = '#000000' if color_name in ['yellow', 'white', 'cyan', 'lime'] else '#FFFFFF'
             is_selected = saved_coord_color == color_name
-            btn.setStyleSheet(f"""
-                QPushButton {{
-                    background-color: {color_hex};
-                    color: {text_color};
-                    font-size: 10px;
-                    font-weight: bold;
-                    padding: 8px 12px;
-                    border: {'4px solid #007AFF' if is_selected else '2px solid #ddd'};
-                    border-radius: 6px;
-                    min-width: 50px;
-                }}
-                QPushButton:hover {{
-                    border: 3px solid #007AFF;
-                    background-color: {color_hex};
-                }}
-                QPushButton:pressed {{
-                    border: 4px solid #0051d5;
-                }}
-            """)
+            btn.setStyleSheet(get_button_stylesheet(color_hex, text_color, is_selected))
             btn.clicked.connect(lambda checked, c=color_name: self.set_coord_color(c))
             self.coord_color_buttons[color_name] = btn
             color_layout.addWidget(btn)
@@ -1284,7 +1570,7 @@ class ConfTab(QWidget):
         self.meta_font_size_slider.setMaximum(48)
         self.meta_font_size_slider.setStyleSheet(SLIDER_STYLESHEET)
         try:
-            meta_font_size = int(self.config.get('gps', 'meta_font_size', fallback='12'))
+            meta_font_size = self.config.get_int('gps', 'meta_font_size', default=12)
             self.meta_font_size_slider.setValue(meta_font_size)
         except:
             self.meta_font_size_slider.setValue(12)
@@ -1304,32 +1590,14 @@ class ConfTab(QWidget):
         meta_color_label.setStyleSheet("font-size: 12px; color: #333; min-width: 80px; border: none;")
         meta_color_layout.addWidget(meta_color_label)
         
-        saved_meta_color = self.config.get('gps', 'meta_color', fallback='white')
+        saved_meta_color = self.config.get_str('gps', 'meta_color', default='white')
         self.meta_color_buttons = {}
         
         for color_name, color_hex in colors.items():
             btn = QPushButton(color_name.upper())
             text_color = '#000000' if color_name in ['yellow', 'white', 'cyan', 'lime'] else '#FFFFFF'
             is_selected = saved_meta_color == color_name
-            btn.setStyleSheet(f"""
-                QPushButton {{
-                    background-color: {color_hex};
-                    color: {text_color};
-                    font-size: 10px;
-                    font-weight: bold;
-                    padding: 8px 12px;
-                    border: {'4px solid #007AFF' if is_selected else '2px solid #ddd'};
-                    border-radius: 6px;
-                    min-width: 50px;
-                }}
-                QPushButton:hover {{
-                    border: 3px solid #007AFF;
-                    background-color: {color_hex};
-                }}
-                QPushButton:pressed {{
-                    border: 4px solid #0051d5;
-                }}
-            """)
+            btn.setStyleSheet(get_button_stylesheet(color_hex, text_color, is_selected))
             btn.clicked.connect(lambda checked, c=color_name: self.set_meta_color(c))
             self.meta_color_buttons[color_name] = btn
             meta_color_layout.addWidget(btn)
@@ -1349,7 +1617,7 @@ class ConfTab(QWidget):
         bg_color_label.setStyleSheet("font-size: 12px; color: #333; min-width: 80px; border: none;")
         bg_color_layout.addWidget(bg_color_label)
         
-        saved_bg_color = self.config.get('coords', 'bg_color', fallback='black')
+        saved_bg_color = self.config.get_str('coords', 'bg_color', default='black')
         self.bg_color_buttons = {}
         
         # HSV color definitions: (Hue, Saturation, Value_max)
@@ -1368,24 +1636,7 @@ class ConfTab(QWidget):
             
             btn = QPushButton(color_name.upper())
             is_selected = saved_bg_color == color_name
-            btn.setStyleSheet(f"""
-                QPushButton {{
-                    background-color: {rgb_hex};
-                    color: #FFFFFF;
-                    font-size: 10px;
-                    font-weight: bold;
-                    padding: 8px 15px;
-                    border: {'4px solid #007AFF' if is_selected else '2px solid #ddd'};
-                    border-radius: 6px;
-                    min-width: 70px;
-                }}
-                QPushButton:hover {{
-                    border: 3px solid #007AFF;
-                }}
-                QPushButton:pressed {{
-                    border: 4px solid #0051d5;
-                }}
-            """)
+            btn.setStyleSheet(get_button_stylesheet(rgb_hex, '#FFFFFF', is_selected))
             # Connect button click
             btn.clicked.connect(lambda checked, c=color_name: self.set_bg_color(c))
             self.bg_color_buttons[color_name] = btn
@@ -1401,7 +1652,7 @@ class ConfTab(QWidget):
         bg_label.setStyleSheet("font-size: 12px; color: #333; min-width: 80px; border: none;")
         bg_slider_layout.addWidget(bg_label)
         
-        saved_brightness = int(self.config.get('coords', 'bg_brightness', fallback='0'))
+        saved_brightness = self.config.get_int('coords', 'bg_brightness', default=0)
         self.bg_brightness_slider = QSlider(Qt.Horizontal)
         self.bg_brightness_slider.setMinimum(0)
         self.bg_brightness_slider.setMaximum(100)
@@ -1426,9 +1677,178 @@ class ConfTab(QWidget):
         
         # ─── MAP SECTION (COLLAPSIBLE) ───
         map_section = CollapsibleSection("Map")
-        map_label = QLabel("(No settings available)")
-        map_label.setStyleSheet("font-size: 12px; color: #999;")
-        map_section.add_to_layout(map_label)
+        
+        # Record group box (with 1px border)
+        record_box = QGroupBox("Record")
+        record_box.setStyleSheet("""
+            QGroupBox {
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                margin-top: 10px;
+                padding-top: 10px;
+                font-size: 12px;
+                font-weight: bold;
+                color: #333;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0px 5px 0px 0px;
+            }
+        """)
+        record_layout = QVBoxLayout()
+        record_layout.setContentsMargins(10, 5, 10, 5)
+        record_layout.setSpacing(5)
+        
+        # Time based sampling
+        time_layout = QHBoxLayout()
+        time_label = QLabel("Time based:")
+        time_label.setStyleSheet("font-size: 12px; color: #333; min-width: 80px; border: none;")
+        time_layout.addWidget(time_label)
+        
+        self.time_buttons = {}
+        times = ["10s", "15s", "20s", "30s"]
+        
+        # Load saved time selection
+        saved_time = self.config.get_str('map', 'time_based_sampling', default='15s')
+        
+        for time_str in times:
+            btn = QPushButton(time_str)
+            is_selected = time_str == saved_time
+            btn.setStyleSheet(get_button_stylesheet("#2196F3", "white", is_selected))
+            btn.setCheckable(True)
+            btn.setChecked(is_selected)
+            btn.clicked.connect(lambda checked, t=time_str: self.on_time_selected(t))
+            self.time_buttons[time_str] = btn
+            time_layout.addWidget(btn)
+        
+        self.selected_time = saved_time
+        
+        time_layout.addStretch()
+        record_layout.addLayout(time_layout)
+        
+        # Color for recording path
+        color_layout = QHBoxLayout()
+        color_label = QLabel("Path color:")
+        color_label.setStyleSheet("font-size: 12px; color: #333; min-width: 80px; border: none;")
+        color_layout.addWidget(color_label)
+        
+        saved_rec_color = self.config.get_str('map', 'recording_color', default='RED')
+        self.rec_color_buttons = {}
+        rec_colors = {
+            'RED': '#FF0000',
+            'BLUE': '#0000FF',
+            'GREEN': '#00FF00',
+            'YELLOW': '#FFFF00',
+            'CYAN': '#00FFFF',
+            'MAGENTA': '#FF00FF',
+            'ORANGE': '#FFA500',
+            'PURPLE': '#800080',
+        }
+        
+        for color_name, color_hex in rec_colors.items():
+            btn = QPushButton()
+            text_color = '#000000' if color_name in ['YELLOW', 'CYAN'] else '#FFFFFF'
+            is_selected = saved_rec_color == color_name
+            btn.setMinimumWidth(60)
+            btn.setMaximumWidth(60)
+            btn.setFixedHeight(30)
+            # Use narrow stylesheet without min/max width constraints
+            stylesheet = f"""
+                QPushButton {{
+                    background-color: {color_hex};
+                    color: {text_color};
+                    font-size: 10px;
+                    font-weight: bold;
+                    padding: 6px 2px;
+                    border: {'4px solid #007AFF' if is_selected else '2px solid #ddd'};
+                    border-radius: 4px;
+                }}
+                QPushButton:hover {{
+                    border: 3px solid #007AFF;
+                    background-color: {color_hex};
+                }}
+                QPushButton:pressed {{
+                    border: 4px solid #0051d5;
+                }}
+            """
+            btn.setStyleSheet(stylesheet)
+            btn.clicked.connect(lambda checked, c=color_name: self.on_rec_color_selected(c))
+            self.rec_color_buttons[color_name] = btn
+            color_layout.addWidget(btn)
+        
+        self.selected_rec_color = saved_rec_color
+        color_layout.addStretch()
+        record_layout.addLayout(color_layout)
+        
+        # Path width slider
+        path_width_layout = QHBoxLayout()
+        path_width_label = QLabel("Path width:")
+        path_width_label.setStyleSheet("font-size: 12px; color: #333; min-width: 100px; border: none;")
+        path_width_layout.addWidget(path_width_label)
+        
+        self.path_width_slider = QSlider(Qt.Horizontal)
+        self.path_width_slider.setMinimum(1)
+        self.path_width_slider.setMaximum(8)
+        self.path_width_slider.setStyleSheet(SLIDER_STYLESHEET)
+        path_width = self.config.get_int('map', 'path_width', default=1)
+        self.path_width_slider.setValue(path_width)
+        
+        self.path_width_slider.valueChanged.connect(self.save_config)
+        path_width_layout.addWidget(self.path_width_slider)
+        
+        self.path_width_value = QLabel(str(self.path_width_slider.value()))
+        self.path_width_value.setStyleSheet("font-size: 12px; color: #007AFF; font-weight: bold; min-width: 35px; border: none;")
+        self.path_width_slider.valueChanged.connect(lambda v: self.path_width_value.setText(str(v)))
+        path_width_layout.addWidget(self.path_width_value)
+        record_layout.addLayout(path_width_layout)
+        
+        # Position radius slider
+        radius_layout = QHBoxLayout()
+        radius_label = QLabel("Position radius:")
+        radius_label.setStyleSheet("font-size: 12px; color: #333; min-width: 100px; border: none;")
+        radius_layout.addWidget(radius_label)
+        
+        self.position_radius_slider = QSlider(Qt.Horizontal)
+        self.position_radius_slider.setMinimum(1)
+        self.position_radius_slider.setMaximum(10)
+        self.position_radius_slider.setStyleSheet(SLIDER_STYLESHEET)
+        position_radius = self.config.get_int('map', 'position_radius', default=2)
+        self.position_radius_slider.setValue(position_radius)
+        
+        self.position_radius_slider.valueChanged.connect(self.save_config)
+        radius_layout.addWidget(self.position_radius_slider)
+        
+        self.position_radius_value = QLabel(str(self.position_radius_slider.value()))
+        self.position_radius_value.setStyleSheet("font-size: 12px; color: #007AFF; font-weight: bold; min-width: 35px; border: none;")
+        self.position_radius_slider.valueChanged.connect(lambda v: self.position_radius_value.setText(str(v)))
+        radius_layout.addWidget(self.position_radius_value)
+        record_layout.addLayout(radius_layout)
+        
+        # Position font size slider
+        pos_font_layout = QHBoxLayout()
+        pos_font_label = QLabel("Position font:")
+        pos_font_label.setStyleSheet("font-size: 12px; color: #333; min-width: 100px; border: none;")
+        pos_font_layout.addWidget(pos_font_label)
+        
+        self.position_font_size_slider = QSlider(Qt.Horizontal)
+        self.position_font_size_slider.setMinimum(6)
+        self.position_font_size_slider.setMaximum(16)
+        self.position_font_size_slider.setStyleSheet(SLIDER_STYLESHEET)
+        position_font_size = self.config.get_int('map', 'position_font_size', default=8)
+        self.position_font_size_slider.setValue(position_font_size)
+        
+        self.position_font_size_slider.valueChanged.connect(self.save_config)
+        pos_font_layout.addWidget(self.position_font_size_slider)
+        
+        self.position_font_size_value = QLabel(str(self.position_font_size_slider.value()))
+        self.position_font_size_value.setStyleSheet("font-size: 12px; color: #007AFF; font-weight: bold; min-width: 35px; border: none;")
+        self.position_font_size_slider.valueChanged.connect(lambda v: self.position_font_size_value.setText(str(v)))
+        pos_font_layout.addWidget(self.position_font_size_value)
+        record_layout.addLayout(pos_font_layout)
+        
+        record_box.setLayout(record_layout)
+        map_section.add_to_layout(record_box)
         scroll_layout.addWidget(map_section)
         
         scroll_layout.addSpacing(10)
@@ -1443,7 +1863,7 @@ class ConfTab(QWidget):
         grace_label.setStyleSheet("font-size: 12px; color: #333; min-width: 160px; border: none;")
         grace_period_layout.addWidget(grace_label)
         
-        saved_grace_period = int(self.config.get('camera_settings', 'grace_period_seconds', fallback='10'))
+        saved_grace_period = self.config.get_int('camera_settings', 'grace_period_seconds', default=10)
         self.grace_period_slider = QSlider(Qt.Horizontal)
         self.grace_period_slider.setMinimum(1)
         self.grace_period_slider.setMaximum(60)
@@ -1468,7 +1888,7 @@ class ConfTab(QWidget):
         font_size_label.setStyleSheet("font-size: 12px; color: #333; min-width: 160px; border: none;")
         font_size_layout.addWidget(font_size_label)
         
-        saved_label_font_size = int(self.config.get('camera_settings', 'label_font_size', fallback='16'))
+        saved_label_font_size = self.config.get_int('camera_settings', 'label_font_size', default=16)
         self.camera_label_font_size_slider = QSlider(Qt.Horizontal)
         self.camera_label_font_size_slider.setMinimum(8)
         self.camera_label_font_size_slider.setMaximum(32)
@@ -1492,7 +1912,7 @@ class ConfTab(QWidget):
         color_label.setStyleSheet("font-size: 12px; color: #333; min-width: 160px; border: none;")
         color_layout.addWidget(color_label)
         
-        saved_label_color = self.config.get('camera_settings', 'label_color', fallback='white')
+        saved_label_color = self.config.get_str('camera_settings', 'label_color', default='white')
         self.camera_label_color_buttons = {}
         colors = {'white': '#FFFFFF', 'yellow': '#FFFF00', 'cyan': '#00FFFF', 'lime': '#00FF00', 'red': '#FF0000'}
         
@@ -1500,20 +1920,7 @@ class ConfTab(QWidget):
             btn = QPushButton(color_name.capitalize())
             is_selected = saved_label_color == color_name
             text_color = '#000000' if color_name in ['white', 'yellow', 'cyan', 'lime'] else '#FFFFFF'
-            
-            btn.setStyleSheet(f"""
-                QPushButton {{
-                    background-color: {color_hex};
-                    color: {text_color};
-                    font-size: 11px;
-                    font-weight: bold;
-                    padding: 6px 10px;
-                    border: {'3px solid #000' if is_selected else '2px solid #ddd'};
-                    border-radius: 4px;
-                    min-width: 50px;
-                }}
-            """)
-            
+            btn.setStyleSheet(get_button_stylesheet(color_hex, text_color, is_selected))
             btn.clicked.connect(lambda checked, c=color_name: self.set_camera_label_color(c))
             self.camera_label_color_buttons[color_name] = btn
             color_layout.addWidget(btn)
@@ -1552,7 +1959,7 @@ class ConfTab(QWidget):
                 rotation_layout.setSpacing(8)
                 
                 rotation_buttons = {}
-                saved_rotation = int(self.config.get('camera_rotations', cam_name, fallback='0'))
+                saved_rotation = self.config.get_int('camera_rotations', cam_name, default=0)
                 
                 for angle in [0, 90, 180, 270]:
                     btn = QPushButton(f"{angle}°")
@@ -1705,6 +2112,78 @@ class ConfTab(QWidget):
         
         return (int((r + m) * 255), int((g + m) * 255), int((b + m) * 255))
     
+    def on_rec_color_selected(self, color_name):
+        """Handle recording path color selection"""
+        # Stylesheet for color buttons (no min/max width constraints)
+        def get_color_button_stylesheet(bg_color_hex, text_color, is_selected):
+            return f"""
+                QPushButton {{
+                    background-color: {bg_color_hex};
+                    color: {text_color};
+                    font-size: 10px;
+                    font-weight: bold;
+                    padding: 6px 2px;
+                    border: {'4px solid #007AFF' if is_selected else '2px solid #ddd'};
+                    border-radius: 4px;
+                }}
+                QPushButton:hover {{
+                    border: 3px solid #007AFF;
+                    background-color: {bg_color_hex};
+                }}
+                QPushButton:pressed {{
+                    border: 4px solid #0051d5;
+                }}
+            """
+        
+        # Update all color buttons
+        rec_colors = {
+            'RED': '#FF0000', 'BLUE': '#0000FF', 'GREEN': '#00FF00', 'YELLOW': '#FFFF00',
+            'CYAN': '#00FFFF', 'MAGENTA': '#FF00FF', 'ORANGE': '#FFA500', 'PURPLE': '#800080',
+        }
+        
+        for c, btn in self.rec_color_buttons.items():
+            is_selected = (c == color_name)
+            text_color = '#000000' if c in ['YELLOW', 'CYAN'] else '#FFFFFF'
+            btn.setStyleSheet(get_color_button_stylesheet(rec_colors[c], text_color, is_selected))
+        
+        self.selected_rec_color = color_name
+        print(f"[CONF] Selected recording path color: {color_name}")
+        self.save_config()
+    
+    def on_time_selected(self, time_str):
+        """Handle time selection for recording"""
+        # Get the common stylesheet function
+        def get_button_stylesheet(bg_color_hex, text_color, is_selected):
+            return f"""
+                QPushButton {{
+                    background-color: {bg_color_hex};
+                    color: {text_color};
+                    font-size: 10px;
+                    font-weight: bold;
+                    padding: 8px 12px;
+                    border: {'4px solid #007AFF' if is_selected else '2px solid #ddd'};
+                    border-radius: 6px;
+                    min-width: 50px;
+                }}
+                QPushButton:hover {{
+                    border: 3px solid #007AFF;
+                    background-color: {bg_color_hex};
+                }}
+                QPushButton:pressed {{
+                    border: 4px solid #0051d5;
+                }}
+            """
+        
+        # Update all buttons
+        for t, btn in self.time_buttons.items():
+            is_selected = (t == time_str)
+            btn.setChecked(is_selected)
+            btn.setStyleSheet(get_button_stylesheet("#2196F3", "white", is_selected))
+        
+        self.selected_time = time_str
+        print(f"[CONF] Selected time-based sampling: {time_str}")
+        self.save_config()
+    
     def set_coord_color(self, color_name):
         """Set coordinate color and update button styling"""
         self.selected_coord_color = color_name
@@ -1831,13 +2310,7 @@ class ConfTab(QWidget):
     def on_grace_period_released(self):
         """Handle grace period slider release - save to config immediately"""
         value = self.grace_period_slider.value()
-        if not self.config.has_section('camera_settings'):
-            self.config.add_section('camera_settings')
-        self.config.set('camera_settings', 'grace_period_seconds', str(value))
-        
-        config_file = os.path.expanduser("~/Projects/seeboard/see_board.cfg")
-        with open(config_file, 'w') as f:
-            self.config.write(f)
+        self.config.set_value('camera_settings', 'grace_period_seconds', str(value))
     
     def set_camera_label_color(self, color_name):
         """Set camera label color and update button styling"""
@@ -1955,7 +2428,7 @@ class ConfTab(QWidget):
                     rotation_layout.setSpacing(8)
                     
                     rotation_buttons = {}
-                    saved_rotation = int(self.config.get('camera_rotations', cam_name, fallback='0'))
+                    saved_rotation = self.config.get_int('camera_rotations', cam_name, default=0)
                     
                     for angle in [0, 90, 180, 270]:
                         btn = QPushButton(f"{angle}°")
@@ -1997,14 +2470,13 @@ class ConfTab(QWidget):
     def set_camera_rotation(self, camera_name, angle):
         """Set camera rotation and update button styling"""
         try:
-            if not self.config.has_section('camera_rotations'):
-                self.config.add_section('camera_rotations')
+            self.config.ensure_section('camera_rotations')
             
             # Ensure camera_name is string
             if not isinstance(camera_name, str):
                 camera_name = str(camera_name)
             
-            self.config.set('camera_rotations', camera_name, str(angle))
+            self.config.set_value('camera_rotations', camera_name, str(angle))
             
             # Update button styling
             if camera_name in self.camera_combos:
@@ -2041,40 +2513,45 @@ class ConfTab(QWidget):
     def save_config(self):
         """Save configuration to file (called on every change)"""
         # DMS decimals
-        self.config.set('gps', 'show_dms_decimals', str(self.dms_checkbox.isChecked()))
+        self.config.set_value('gps', 'show_dms_decimals', str(self.dms_checkbox.isChecked()))
         gps_core.SHOW_DMS_DECIMALS = self.dms_checkbox.isChecked()
         
         # Coordinate font size
-        self.config.set('gps', 'coord_font_size', str(self.font_size_slider.value()))
+        self.config.set_value('gps', 'coord_font_size', str(self.font_size_slider.value()))
         
         # Coordinate color
-        self.config.set('gps', 'coord_color', self.selected_coord_color)
+        self.config.set_value('gps', 'coord_color', self.selected_coord_color)
         
         # Metadata font size
-        self.config.set('gps', 'meta_font_size', str(self.meta_font_size_slider.value()))
+        self.config.set_value('gps', 'meta_font_size', str(self.meta_font_size_slider.value()))
         
         # Metadata color
-        self.config.set('gps', 'meta_color', self.selected_meta_color)
+        self.config.set_value('gps', 'meta_color', self.selected_meta_color)
         
         # Background color and brightness
-        if not self.config.has_section('coords'):
-            self.config.add_section('coords')
-        self.config.set('coords', 'bg_color', self.selected_bg_color)
-        self.config.set('coords', 'bg_brightness', str(self.bg_brightness_slider.value()))
+        self.config.ensure_section('coords')
+        self.config.set_value('coords', 'bg_color', self.selected_bg_color)
+        self.config.set_value('coords', 'bg_brightness', str(self.bg_brightness_slider.value()))
+        
+        # Map time-based sampling
+        self.config.ensure_section('map')
+        self.config.set_value('map', 'time_based_sampling', self.selected_time)
+        self.config.set_value('map', 'recording_color', self.selected_rec_color)
+        self.config.set_value('map', 'position_radius', str(self.position_radius_slider.value()))
+        self.config.set_value('map', 'position_font_size', str(self.position_font_size_slider.value()))
+        self.config.set_value('map', 'path_width', str(self.path_width_slider.value()))
         
         # Camera settings (label font size and color)
-        if not self.config.has_section('camera_settings'):
-            self.config.add_section('camera_settings')
-        self.config.set('camera_settings', 'label_font_size', str(self.camera_label_font_size_slider.value()))
+        self.config.ensure_section('camera_settings')
+        self.config.set_value('camera_settings', 'label_font_size', str(self.camera_label_font_size_slider.value()))
         # Find selected camera label color
         for color_name, btn in self.camera_label_color_buttons.items():
             if '3px solid' in btn.styleSheet():
-                self.config.set('camera_settings', 'label_color', color_name)
+                self.config.set_value('camera_settings', 'label_color', color_name)
                 break
         
         # Per-camera rotations
-        if not self.config.has_section('camera_rotations'):
-            self.config.add_section('camera_rotations')
+        self.config.ensure_section('camera_rotations')
         
         for cam_name, buttons_dict in self.camera_combos.items():
             # buttons_dict is now a dict of angle -> button, not a QComboBox
@@ -2086,20 +2563,17 @@ class ConfTab(QWidget):
             else:
                 # Legacy support if somehow still a QComboBox
                 rotation = buttons_dict.currentIndex() * 90
-                self.config.set('camera_rotations', cam_name, str(rotation))
-        
-        # Write config file
-        config_file = os.path.expanduser("~/Projects/seeboard/see_board.cfg")
-        with open(config_file, 'w') as f:
-            self.config.write(f)
+                self.config.set_value('camera_rotations', cam_name, str(rotation))
 
 
 class PathsTab(QWidget):
-    """Paths Tab - shows existing recorded paths"""
+    """Paths Tab - shows existing recorded paths with delete buttons"""
     
-    def __init__(self, config):
+    def __init__(self, config, main_window=None):
         super().__init__()
         self.config = config
+        self.main_window = main_window  # Reference to parent window for triggering map refresh
+        self.paths_data = {}  # Store path_id -> name mapping
         
         layout = QVBoxLayout()
         layout.setContentsMargins(10, 10, 10, 10)
@@ -2109,28 +2583,24 @@ class PathsTab(QWidget):
         title.setStyleSheet("font-size: 14px; font-weight: bold;")
         layout.addWidget(title)
         
-        # Paths list
-        self.paths_list = QListWidget()
-        self.paths_list.setStyleSheet("""
-            QListWidget {
+        # Paths list with scroll area
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("""
+            QScrollArea {
                 background-color: #f5f5f5;
                 border: 1px solid #ddd;
                 border-radius: 4px;
-                padding: 5px;
-            }
-            QListWidget::item {
-                padding: 8px;
-                border-bottom: 1px solid #eee;
-            }
-            QListWidget::item:hover {
-                background-color: #e8e8e8;
-            }
-            QListWidget::item:selected {
-                background-color: #2196F3;
-                color: white;
             }
         """)
-        layout.addWidget(self.paths_list)
+        
+        self.paths_container = QWidget()
+        self.paths_layout = QVBoxLayout()
+        self.paths_layout.setContentsMargins(5, 5, 5, 5)
+        self.paths_layout.setSpacing(5)
+        self.paths_container.setLayout(self.paths_layout)
+        scroll.setWidget(self.paths_container)
+        layout.addWidget(scroll)
         
         # Refresh button
         refresh_btn = QPushButton("Refresh")
@@ -2145,33 +2615,333 @@ class PathsTab(QWidget):
     
     def refresh_paths(self):
         """Refresh the list of recorded paths from database"""
-        self.paths_list.clear()
+        # Clear existing items
+        while self.paths_layout.count():
+            child = self.paths_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+        
+        self.paths_data.clear()
         
         try:
             # Get paths from global route recorder's database
             if global_route_recorder and global_route_recorder.db and global_route_recorder.db.connection:
                 cursor = global_route_recorder.db.connection.cursor()
-                cursor.execute("SELECT route_id, name FROM routes ORDER BY created_at DESC")
+                cursor.execute("SELECT path_id, name FROM paths ORDER BY created_at DESC")
                 rows = cursor.fetchall()
                 
                 if rows:
                     for row in rows:
-                        path_name = row[1]  # name column
-                        item = QListWidgetItem(path_name)
-                        self.paths_list.addItem(item)
+                        path_id = row[0]
+                        path_name = row[1]
+                        self.paths_data[path_id] = path_name
+                        
+                        # Create row with path name and delete button
+                        row_widget = self._create_path_row(path_id, path_name)
+                        self.paths_layout.addWidget(row_widget)
                 else:
-                    item = QListWidgetItem("No paths recorded yet")
-                    item.setFlags(item.flags() & ~Qt.ItemIsSelectable)
-                    self.paths_list.addItem(item)
+                    label = QLabel("No paths recorded yet")
+                    label.setStyleSheet("color: #999; font-style: italic; padding: 10px;")
+                    self.paths_layout.addWidget(label)
             else:
-                item = QListWidgetItem("Path database not initialized")
-                item.setFlags(item.flags() & ~Qt.ItemIsSelectable)
-                self.paths_list.addItem(item)
+                label = QLabel("Path database not initialized")
+                label.setStyleSheet("color: #999; font-style: italic; padding: 10px;")
+                self.paths_layout.addWidget(label)
         except Exception as e:
             print(f"[PATHS] Error loading paths: {e}")
-            item = QListWidgetItem(f"Error: {str(e)}")
-            item.setFlags(item.flags() & ~Qt.ItemIsSelectable)
-            self.paths_list.addItem(item)
+            label = QLabel(f"Error: {str(e)}")
+            label.setStyleSheet("color: red; padding: 10px;")
+            self.paths_layout.addWidget(label)
+        
+        self.paths_layout.addStretch()
+    
+    def _create_path_row(self, path_id, path_name):
+        """Create a row widget with path name and action buttons"""
+        row = QWidget()
+        row_layout = QHBoxLayout()
+        row_layout.setContentsMargins(10, 5, 10, 5)
+        row_layout.setSpacing(10)
+        
+        # Path name label
+        name_label = QLabel(path_name)
+        name_label.setStyleSheet("font-size: 12px; color: #333;")
+        row_layout.addWidget(name_label, 1)  # Stretch
+        
+        # Visibility checkbox (at beginning of button block)
+        vis_checkbox = QCheckBox()
+        try:
+            cursor = global_route_recorder.db.connection.cursor()
+            cursor.execute("SELECT is_visible FROM paths WHERE path_id = ?", (path_id,))
+            row_data = cursor.fetchone()
+            is_visible = bool(row_data[0]) if row_data else False
+        except:
+            is_visible = False
+        
+        vis_checkbox.setChecked(is_visible)
+        vis_checkbox.stateChanged.connect(lambda state: self.toggle_path_visibility(path_id, state))
+        vis_checkbox.setStyleSheet("""
+            QCheckBox {
+                min-height: 20px;
+                border: none;
+            }
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
+            }
+            QCheckBox::indicator:unchecked {
+                background-color: #ffffff;
+                border: 1px solid #cccccc;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #007AFF;
+                border: 1px solid #007AFF;
+            }
+        """)
+        row_layout.addWidget(vis_checkbox)
+        
+        # Get path color from database
+        try:
+            cursor = global_route_recorder.db.connection.cursor()
+            cursor.execute("SELECT color FROM paths WHERE path_id = ?", (path_id,))
+            row_data = cursor.fetchone()
+            path_color = row_data[0] if row_data else 'RED'
+        except:
+            path_color = 'RED'
+        
+        # Color mapping
+        color_map = {
+            'RED': '#FF0000',
+            'BLUE': '#0000FF',
+            'GREEN': '#00FF00',
+            'YELLOW': '#FFFF00',
+            'CYAN': '#00FFFF',
+            'MAGENTA': '#FF00FF',
+            'ORANGE': '#FFA500',
+            'PURPLE': '#800080',
+        }
+        
+        path_color_hex = color_map.get(path_color, '#FF0000')
+        
+        # Color button - shows actual path color
+        color_btn = QPushButton()
+        color_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {path_color_hex};
+                color: white;
+                border: 2px solid #333;
+                border-radius: 4px;
+                padding: 6px 8px;
+                font-size: 12px;
+                font-weight: bold;
+                min-width: 30px;
+                max-width: 30px;
+            }}
+            QPushButton:hover {{
+                border: 2px solid #000;
+            }}
+            QPushButton:pressed {{
+                border: 3px solid #000;
+            }}
+        """)
+        color_btn.clicked.connect(lambda: self.set_path_color(path_id, path_name))
+        row_layout.addWidget(color_btn)
+        
+        # Edit button (pencil)
+        edit_btn = QPushButton("✎")
+        edit_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #2196F3;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 6px 8px;
+                font-size: 16px;
+                font-weight: bold;
+                min-width: 30px;
+                max-width: 30px;
+            }
+            QPushButton:hover {
+                background-color: #0b7dda;
+            }
+            QPushButton:pressed {
+                background-color: #0056b3;
+            }
+        """)
+        edit_btn.clicked.connect(lambda: self.edit_path_name(path_id, path_name))
+        row_layout.addWidget(edit_btn)
+        
+        # Delete button (X icon)
+        delete_btn = QPushButton("✕")
+        delete_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #ff4444;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 6px 8px;
+                font-size: 16px;
+                font-weight: bold;
+                min-width: 30px;
+                max-width: 30px;
+            }
+            QPushButton:hover {
+                background-color: #cc0000;
+            }
+            QPushButton:pressed {
+                background-color: #990000;
+            }
+        """)
+        delete_btn.clicked.connect(lambda: self.delete_path(path_id, path_name))
+        row_layout.addWidget(delete_btn)
+        
+        # Container background
+        row.setLayout(row_layout)
+        row.setStyleSheet("""
+            QWidget {
+                background-color: white;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                padding: 5px;
+            }
+        """)
+        
+        return row
+    
+    def delete_path(self, path_id, path_name):
+        """Delete a path from database and refresh list"""
+        try:
+            # Show confirmation dialog
+            from PyQt5.QtWidgets import QMessageBox
+            reply = QMessageBox.question(
+                self,
+                "Delete Path",
+                f"Are you sure you want to delete '{path_name}'?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Yes:
+                if global_route_recorder and global_route_recorder.db:
+                    global_route_recorder.db.delete_route(path_id)
+                    print(f"[PATHS] Deleted path: {path_name} (ID: {path_id})")
+                    self.refresh_paths()
+        except Exception as e:
+            print(f"[PATHS] Error deleting path {path_id}: {e}")
+    
+    def toggle_path_visibility(self, path_id, state):
+        """Toggle visibility of a path and refresh map display"""
+        try:
+            is_visible = state == 2  # Qt.Checked = 2
+            if global_route_recorder and global_route_recorder.db:
+                cursor = global_route_recorder.db.connection.cursor()
+                cursor.execute("UPDATE paths SET is_visible = ? WHERE path_id = ?", (is_visible, path_id))
+                global_route_recorder.db.connection.commit()
+                print(f"[PATHS] Path {path_id} visibility set to {is_visible}")
+                
+                # Trigger map re-render to show/hide the path
+                # Find the MapTab and request a render
+                if hasattr(self, 'main_window') and self.main_window:
+                    if hasattr(self.main_window, 'map_tab'):
+                        self.main_window.map_tab.render_map()
+        except Exception as e:
+            print(f"[PATHS] Error toggling path visibility {path_id}: {e}")
+    
+    def set_path_color(self, path_id, path_name):
+        """Set color for a path"""
+        try:
+            from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QPushButton
+            
+            # Create color selection dialog
+            dialog = QDialog(self)
+            dialog.setWindowTitle(f"Set Color for '{path_name}'")
+            dialog.setGeometry(100, 100, 300, 150)
+            
+            layout = QVBoxLayout()
+            
+            colors = {
+                'RED': '#FF0000',
+                'BLUE': '#0000FF',
+                'GREEN': '#00FF00',
+                'YELLOW': '#FFFF00',
+                'CYAN': '#00FFFF',
+                'MAGENTA': '#FF00FF',
+                'ORANGE': '#FFA500',
+                'PURPLE': '#800080',
+            }
+            
+            buttons_layout = QHBoxLayout()
+            
+            def select_color(color_name):
+                if global_route_recorder and global_route_recorder.db:
+                    cursor = global_route_recorder.db.connection.cursor()
+                    cursor.execute("UPDATE paths SET color = ? WHERE path_id = ?", (color_name, path_id))
+                    global_route_recorder.db.connection.commit()
+                    print(f"[PATHS] Set path '{path_name}' color to {color_name}")
+                    dialog.close()
+                    self.refresh_paths()
+                    # Trigger map re-render to show updated color
+                    if self.main_window and hasattr(self.main_window, 'map_tab'):
+                        self.main_window.map_tab.render_map()
+            
+            for color_name, color_hex in colors.items():
+                btn = QPushButton(color_name)
+                text_color = '#000000' if color_name in ['YELLOW', 'CYAN'] else '#FFFFFF'
+                btn.setStyleSheet(f"""
+                    QPushButton {{
+                        background-color: {color_hex};
+                        color: {text_color};
+                        font-size: 10px;
+                        font-weight: bold;
+                        padding: 8px 12px;
+                        border: none;
+                        border-radius: 4px;
+                        min-width: 50px;
+                    }}
+                    QPushButton:hover {{
+                        border: 2px solid #000;
+                    }}
+                """)
+                btn.clicked.connect(lambda checked, c=color_name: select_color(c))
+                buttons_layout.addWidget(btn)
+            
+            layout.addLayout(buttons_layout)
+            dialog.setLayout(layout)
+            dialog.exec_()
+        except Exception as e:
+            print(f"[PATHS] Error setting path color {path_id}: {e}")
+    
+    def edit_path_name(self, path_id, old_name):
+        """Edit the name of a path"""
+        try:
+            from PyQt5.QtWidgets import QInputDialog, QMessageBox
+            
+            new_name, ok = QInputDialog.getText(
+                self,
+                "Edit Path Name",
+                "Enter new path name:",
+                text=old_name
+            )
+            
+            if ok and new_name and new_name != old_name:
+                if global_route_recorder and global_route_recorder.db:
+                    # Check if new name already exists
+                    cursor = global_route_recorder.db.connection.cursor()
+                    cursor.execute("SELECT COUNT(*) FROM paths WHERE name = ? AND path_id != ?", (new_name, path_id))
+                    exists = cursor.fetchone()[0] > 0
+                    
+                    # If exists, append original name with dash
+                    if exists:
+                        final_name = f"{new_name}-{old_name}"
+                    else:
+                        final_name = new_name
+                    
+                    # Update database
+                    cursor.execute("UPDATE paths SET name = ? WHERE path_id = ?", (final_name, path_id))
+                    global_route_recorder.db.connection.commit()
+                    print(f"[PATHS] Renamed path from '{old_name}' to '{final_name}'")
+                    self.refresh_paths()
+        except Exception as e:
+            print(f"[PATHS] Error editing path name {path_id}: {e}")
 
 
 class SeeBoardApp(QMainWindow):
@@ -2191,21 +2961,21 @@ class SeeBoardApp(QMainWindow):
         
         # Load config
         config_file = os.path.expanduser("~/Projects/seeboard/see_board.cfg")
-        self.config = ConfigParser()
-        self.config.read(config_file)
+        config = ConfigParser()
+        config.read(config_file)
         
-        for section in ['gps', 'coords', 'route_recording', 'camera_rotations', 'cam']:
-            if not self.config.has_section(section):
-                self.config.add_section(section)
+        # Create centralized config loader
+        self.config = ConfigLoader(config)
+        self.config.ensure_sections(['gps', 'coords', 'route_recording', 'camera_rotations', 'cam', 'map'])
         
         self.setWindowTitle("seeBoard - GPS & Camera Dashboard")
         self.setGeometry(100, 100, 800, 600)
         
-        # Create tabs
+        # Create tabs (pass ConfigLoader to all tabs)
         self.tabs = QTabWidget()
         self.coords_tab = CoordsTab(self.config)
         self.map_tab = MapTab(self.config)
-        self.paths_tab = PathsTab(self.config)
+        self.paths_tab = PathsTab(self.config, self)
         self.cam_tab = CamTab(self.config)
         self.conf_tab = ConfTab(self.config, self)
         

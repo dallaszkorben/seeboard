@@ -11,20 +11,20 @@ from datetime import datetime
 from typing import Optional, Callable, Dict
 
 try:
-    from .route_database import RouteDatabase
+    from .route_database import PathDatabase
 except ImportError:
-    from route_database import RouteDatabase
+    from route_database import PathDatabase
 
 
 class RouteRecorder:
     """Manages GPS route recording with configurable sampling"""
 
-    def __init__(self, db: RouteDatabase):
+    def __init__(self, db: PathDatabase):
         """
         Initialize route recorder
         
         Args:
-            db: RouteDatabase instance
+            db: PathDatabase instance
         """
         self.db = db
         self.current_route_id: Optional[int] = None
@@ -41,18 +41,18 @@ class RouteRecorder:
                    'sampling_mode', 'sampling_value'
         
         Returns:
-            route_id of new recording
+            path_id of new recording
         """
         # Stop previous recording if exists
         if self.current_route_id is not None:
             self.stop_recording()
         
-        # Create route name from current timestamp (ISO 8601 format)
-        route_name = datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+        # Create path name from current timestamp (ISO 8601 format)
+        path_name = datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
         
-        # Create new route
-        self.current_route_id = self.db.create_route(
-            name=route_name,
+        # Create new path
+        self.current_route_id = self.db.create_path(
+            name=path_name,
             color=config.get('line_color', 'RED'),
             line_width=config.get('line_width', 3),
             line_style=config.get('line_style', 'continuous'),
@@ -73,12 +73,12 @@ class RouteRecorder:
         Stop the current recording session
         
         Returns:
-            route_id that was stopped, or None if no recording active
+            path_id that was stopped, or None if no recording active
         """
         if self.current_route_id is None:
             return None
         
-        self.db.stop_route(self.current_route_id)
+        self.db.stop_path(self.current_route_id)
         stopped_id = self.current_route_id
         self.current_route_id = None
         self.last_recorded_point = None
@@ -109,13 +109,13 @@ class RouteRecorder:
         if not current_lat or not current_lon:
             return False
         
-        # Get route configuration
-        route = self.db.get_route(self.current_route_id)
-        if not route:
+        # Get path configuration
+        path = self.db.get_path(self.current_route_id)
+        if not path:
             return False
         
-        sampling_mode = route['sampling_mode']
-        sampling_value = route['sampling_value']
+        sampling_mode = path['sampling_mode']
+        sampling_value = path['sampling_value']
         
         if sampling_mode == 'distance':
             # Check if distance threshold met
@@ -159,7 +159,7 @@ class RouteRecorder:
             return None
         
         point_id = self.db.add_point(
-            route_id=self.current_route_id,
+            path_id=self.current_route_id,
             latitude=lat,
             longitude=lon,
             altitude=alt,
@@ -182,12 +182,12 @@ class RouteRecorder:
         Get information about current recording
         
         Returns:
-            Dict with route info or None if not recording
+            Dict with path info or None if not recording
         """
         if self.current_route_id is None:
             return None
         
-        return self.db.get_route(self.current_route_id)
+        return self.db.get_path(self.current_route_id)
 
     def is_recording(self) -> bool:
         """Check if currently recording"""
@@ -203,4 +203,4 @@ class RouteRecorder:
         if self.current_route_id is None:
             return []
         
-        return self.db.get_route_points(self.current_route_id)
+        return self.db.get_path_points(self.current_route_id)
