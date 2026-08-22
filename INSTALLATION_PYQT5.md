@@ -55,7 +55,7 @@ Install the remaining Python packages in the virtual environment:
 source venv/bin/activate
 
 # Install pip packages
-pip install pyserial==3.5 pynmea2==1.19.0 zeroconf==0.132.0
+pip install pyserial==3.5 pynmea2==1.19.0 zeroconf==0.132.0 py-staticmaps
 ```
 
 **Verification**:
@@ -64,7 +64,14 @@ source venv/bin/activate
 python3 -c 'import serial; print("✓ pyserial")'
 python3 -c 'import pynmea2; print("✓ pynmea2")'
 python3 -c 'import zeroconf; print("✓ zeroconf")'
+python3 -c 'import staticmaps; print("✓ py-staticmaps")'
 ```
+
+**Package Details**:
+- `pyserial` - GPS serial communication
+- `pynmea2` - NMEA GPS data parsing
+- `zeroconf` - mDNS camera discovery
+- `py-staticmaps` - Map rendering with static map tiles
 
 ### 5. Update Launcher Script
 
@@ -174,9 +181,10 @@ Connect to the Pi's display/touchscreen and:
 2. ✅ **Virtual environment created**: `/home/pi/Projects/seeboard/venv`
 3. ✅ **System PyQt5 installed**: `sudo apt-get install -y python3-pyqt5`
 4. ✅ **pip dependencies installed**:
-   - pyserial 3.5
-   - pynmea2 1.19.0
-   - zeroconf 0.132.0
+   - pyserial 3.5 (GPS serial communication)
+   - pynmea2 1.19.0 (NMEA GPS data parsing)
+   - zeroconf 0.132.0 (mDNS camera discovery)
+   - py-staticmaps 0.5.0 (Map rendering with static tiles)
 5. ✅ **Launcher script updated and renamed**: `seeboard_pyqt5.sh` with PYTHONPATH configuration
 6. ✅ **All imports verified**: All modules import successfully
 
@@ -193,9 +201,13 @@ Connect to the Pi's display/touchscreen and:
 - Prevents conflicts with system packages
 
 **PYTHONPATH Configuration**
-- Virtual environment provides: pyserial, pynmea2, zeroconf
+- Virtual environment provides: pyserial, pynmea2, zeroconf, py-staticmaps
 - System provides: PyQt5 (via /usr/lib/python3/dist-packages, /usr/lib/python3.11/dist-packages)
 - Launcher script automatically exports PYTHONPATH to make both available
+
+**Map Rendering**
+- `py-staticmaps` is used by `MapRenderer` to render offline maps with path lines and position markers
+- Reference: See `docs/METHODS_REFERENCE.md` for map rendering implementation details
 
 ### Next Steps
 
