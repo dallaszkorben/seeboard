@@ -1,5 +1,31 @@
 # seeBoard Development Notes
 
+## ⚠️ CRITICAL: GIT WORKFLOW POLICY
+
+**DO NOT TOUCH THE GIT REPOSITORY.** 
+
+You should not make any `git` commands including:
+- `git add`
+- `git commit`
+- `git push`
+- `git mv`
+- Any other git operations
+
+**Why:** This is YOUR repository. Only YOU should manage git history and remote pushes. Automated git operations can cause:
+- Unwanted commits in your history
+- Accidental pushes that you didn't review
+- Loss of control over what gets committed
+- Conflicts with your own git workflow
+
+**What to do instead:**
+1. Make code/documentation changes
+2. You manually review the changes
+3. You manually run `git add`, `git commit`, `git push`
+
+This ensures you maintain full control over your repository and commit history.
+
+---
+
 ## Critical Implementation Solutions
 
 ### 1. Collapsible Sections with Instant Layout Updates
