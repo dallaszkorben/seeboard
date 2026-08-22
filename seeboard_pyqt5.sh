@@ -9,18 +9,9 @@ source venv/bin/activate
 # Add system packages to Python path to access system-installed PyQt5
 export PYTHONPATH="/usr/lib/python3/dist-packages:/usr/lib/python3.11/dist-packages:$PYTHONPATH"
 
-# Run the application
-python3 app/seeboard_pyqt5.py
-
-# Activate virtual environment
-source venv/bin/activate
-
-# Make system packages available to venv
-export PYTHONPATH=/usr/lib/python3/dist-packages:$PYTHONPATH
-
-# Use X11 display (desktop environment)
+# Use framebuffer display (Raspberry Pi touchscreen)
 export DISPLAY=:0
 export PYTHONUNBUFFERED=1
 
-# Run the app
+# Run the application
 python3 app/seeboard_pyqt5.py

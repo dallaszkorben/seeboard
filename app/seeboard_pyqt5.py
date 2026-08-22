@@ -1174,16 +1174,47 @@ class CamTab(QWidget):
         self.cam_label.setFixedSize(800, 600)  # FIXED SIZE - DO NOT GROW
         self.cam_label.setStyleSheet("border: 1px solid black; background: black;")
         self.cam_label.setAlignment(Qt.AlignCenter)
+        self.cam_label.setCursor(Qt.PointingHandCursor)  # Show clickable cursor
         layout.addWidget(self.cam_label)
         self.setLayout(layout)
         
         # Track expired cameras (had frames before, lost signal after grace period)
         self.expired_cameras = {}  # url -> expiry_time
         
+        # Fullscreen state: None = grid view, or url string = fullscreen for that camera
+        self.fullscreen_url = None
+        
+        # Camera positions for grid layout (for click detection)
+        self.camera_positions = {}  # url -> (x, y, w, h) on composite
+        
         # Timer to update camera display every 50ms (same as tkinter)
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_display)
         self.timer.start(50)
+    
+    def mousePressEvent(self, event):
+        """Handle mouse clicks on camera image"""
+        if not self.fullscreen_url:
+            # In grid view - find which camera was clicked
+            click_x = event.pos().x()
+            click_y = event.pos().y()
+            
+            # Scale click position to composite image coordinates (800x600)
+            label_rect = self.cam_label.rect()
+            if label_rect.width() > 0 and label_rect.height() > 0:
+                scale_x = 800 / label_rect.width()
+                scale_y = 600 / label_rect.height()
+                img_x = int(click_x * scale_x)
+                img_y = int(click_y * scale_y)
+                
+                # Find which camera was clicked
+                for url, (x, y, w, h) in self.camera_positions.items():
+                    if x <= img_x < x + w and y <= img_y < y + h:
+                        self.fullscreen_url = url
+                        break
+        else:
+            # In fullscreen - click to go back to grid
+            self.fullscreen_url = None
     
     def on_tab_shown(self):
         """Called when CAM tab becomes visible - reload config to get updated rotations"""
@@ -1198,7 +1229,7 @@ class CamTab(QWidget):
             grace_period = self.config.get_int('camera_settings', 'grace_period_seconds', default=5)
             
             # Log state
-            log_msg = f"[DISPLAY] URLs: {len(urls)}, Expired: {len(self.expired_cameras)}\n"
+            log_msg = f"[DISPLAY] URLs: {len(urls)}, Expired: {len(self.expired_cameras)}, Fullscreen: {self.fullscreen_url}\n"
             
             # Update expired camera tracking
             # Remove from expired if signal returns
@@ -1241,10 +1272,25 @@ class CamTab(QWidget):
                 self.cam_label.setText("All cameras expired...")
                 return
             
-            # Setup grid based on displayable cameras
-            n = len(display_urls)
-            cols = math.ceil(math.sqrt(n))
-            rows = math.ceil(n / cols)
+            # Clear previous positions
+            self.camera_positions.clear()
+            
+            # If fullscreen mode and camera is no longer available, exit fullscreen
+            if self.fullscreen_url and self.fullscreen_url not in display_urls:
+                self.fullscreen_url = None
+            
+            # Setup grid or fullscreen
+            if self.fullscreen_url:
+                # FULLSCREEN MODE - display only selected camera
+                display_urls = [self.fullscreen_url]
+                cols = 1
+                rows = 1
+            else:
+                # GRID MODE - normal multi-camera display
+                n = len(display_urls)
+                cols = math.ceil(math.sqrt(n))
+                rows = math.ceil(n / cols)
+            
             cell_w = w // cols
             cell_h = h // rows
             
@@ -1308,14 +1354,16 @@ class CamTab(QWidget):
                 # Clean hostname
                 display = hostname.split("._")[0] if "._" in hostname else hostname
                 
-                # Draw label (bottom-left)
+                # Draw label (bottom-left) with red background if in fullscreen, black otherwise
                 bbox = draw.textbbox((0, 0), display, font=font)
                 text_w = bbox[2] - bbox[0]
                 text_h = bbox[3] - bbox[1]
                 x = 5
                 y = img.height - text_h - 5
                 
-                draw.rectangle([(x-3, y-3), (x+text_w+3, y+text_h+3)], fill=(0,0,0,200))
+                # Use red background if this is the fullscreen camera, otherwise black
+                label_bg_color = (255, 0, 0, 200) if (self.fullscreen_url and self.fullscreen_url == url) else (0, 0, 0, 200)
+                draw.rectangle([(x-3, y-3), (x+text_w+3, y+text_h+3)], fill=label_bg_color)
                 draw.text((x, y), display, fill=color, font=font)
                 
                 # NO SIGNAL if frame hasn't been updated recently (< 100ms)
@@ -1348,7 +1396,12 @@ class CamTab(QWidget):
                 # Paste to composite
                 r = i // cols
                 c = i % cols
-                composite.paste(img, (c * cell_w, r * cell_h))
+                x_pos = c * cell_w
+                y_pos = r * cell_h
+                composite.paste(img, (x_pos, y_pos))
+                
+                # Record camera position for click detection
+                self.camera_positions[url] = (x_pos, y_pos, cell_w, cell_h)
             
             # Display
             import tempfile
@@ -2970,6 +3023,9 @@ class SeeBoardApp(QMainWindow):
         self.config = ConfigLoader(config)
         self.config.ensure_sections(['gps', 'coords', 'route_recording', 'camera_rotations', 'cam', 'map', 'database'])
         
+        # Initialize route recorder BEFORE creating tabs (PathsTab needs it)
+        init_route_recorder(self.config)
+        
         self.setWindowTitle("seeBoard - GPS & Camera Dashboard")
         self.setGeometry(100, 100, 800, 600)
         
@@ -3027,8 +3083,6 @@ class SeeBoardApp(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     window = SeeBoardApp()
-    # Initialize route recorder with config after app window is created
-    init_route_recorder(window.config)
     window.show()
     sys.exit(app.exec_())
 
