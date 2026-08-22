@@ -292,6 +292,96 @@ enabled = False
 
 ---
 
-**Last Updated:** 2026-08-21
+## Running the Application on Raspberry Pi
+
+### Installation
+
+The application is installed at `/home/pi/Projects/seeboard` on the Raspberry Pi. For complete installation instructions, see `INSTALLATION_PYQT5.md`.
+
+**Quick setup (if not already done):**
+```bash
+# Deploy code to RP
+rsync -avz --delete ~/Projects/boat/general/Code/seeboard/ pi@10.42.0.1:~/Projects/seeboard/ \
+  --exclude=.git --exclude=__pycache__ --exclude=*.pyc
+
+# Create virtual environment
+ssh pi@10.42.0.1
+cd /home/pi/Projects/seeboard
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip setuptools wheel
+sudo apt-get install -y python3-pyqt5
+pip install pyserial==3.5 pynmea2==1.19.0 zeroconf==0.132.0 py-staticmaps==0.5.0
+```
+
+### Running the Application
+
+**Via launcher script (recommended):**
+```bash
+ssh pi@10.42.0.1
+cd /home/pi/Projects/seeboard
+./seeboard_pyqt5.sh
+```
+
+**Manually (for debugging):**
+```bash
+ssh pi@10.42.0.1
+cd /home/pi/Projects/seeboard
+source venv/bin/activate
+export PYTHONPATH="/usr/lib/python3/dist-packages:/usr/lib/python3.11/dist-packages:$PYTHONPATH"
+python3 app/seeboard_pyqt5.py
+```
+
+**On the Raspberry Pi touchscreen directly:**
+1. Connect to the Pi's display/touchscreen
+2. Open a terminal
+3. Run: `cd /home/pi/Projects/seeboard && ./seeboard_pyqt5.sh`
+
+### Configuration
+
+Configuration file: `~/.seeboard/see_board.cfg`
+
+Copy from development machine if needed:
+```bash
+scp ~/Projects/boat/general/Code/seeboard/home/pi/.seeboard/see_board.cfg \
+  pi@10.42.0.1:~/.seeboard/see_board.cfg
+```
+
+### Architecture on RP
+
+```
+Raspberry Pi (WiFi AP: GREEN-BEAN at 10.42.0.1)
+├── seeBoard PyQt5 app (seeboard_pyqt5.py)
+├── GPS module (NEO-7M via /dev/serial0)
+├── Camera discovery (mDNS auto-discovery)
+└── WiFi clients:
+    ├── ESP32-CAM #1 (esp32-cam-*.local)
+    ├── ESP32-CAM #2 (esp32-cam-*.local)
+    └── ...
+```
+
+### Views Available
+
+| Tab    | Function                                      |
+|--------|-----------------------------------------------|
+| COORDS | GPS coordinates (DMS), time, satellite count  |
+| MAP    | Offline map with position and recorded route  |
+| CAM    | Multi-camera grid (MJPEG streaming)           |
+| CONF   | Settings (DMS format, rotations, etc.)        |
+
+### Troubleshooting
+
+- **PyQt5 not found:** Ensure `PYTHONPATH` is set (launcher script handles this)
+- **GPS not detecting:** Check UART enabled: `ls -la /dev/serial0`
+- **Cameras not appearing:** Verify they're on GREEN-BEAN hotspot and mDNS discoverable
+- **App crashes/hangs:** Check disk space (`df -h`) and review system logs
+
+See `INSTALLATION_PYQT5.md` for detailed troubleshooting.
+
+---
+
+**Last Updated:** 2026-08-22
 **Framebuffer Platform:** Raspberry Pi 5" touchscreen (linuxfb)
 **PyQt5 Version:** 5.15+
+**Application Status:** Active (PyQt5-based)
+**Launcher:** `seeboard_pyqt5.sh`
