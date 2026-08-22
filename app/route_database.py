@@ -17,10 +17,21 @@ from typing import Optional, List, Tuple, Dict
 class PathDatabase:
     """SQLite database manager for GPS path recording"""
 
-    def __init__(self):
-        """Initialize database connection and create schema if needed"""
-        # Database path: ~/.seeboard/seeboard.db
-        self.db_path = Path.home() / ".seeboard" / "seeboard.db"
+    def __init__(self, config=None):
+        """Initialize database connection and create schema if needed
+        
+        Args:
+            config: ConfigLoader instance. If provided, reads db_path from config.
+                   If not provided, uses default ~/.seeboard/seeboard.db
+        """
+        # Database path from config or default
+        if config:
+            db_path_str = config.get_str('database', 'path', default=str(Path.home() / ".seeboard" / "seeboard.db"))
+            self.db_path = Path(db_path_str).expanduser()
+        else:
+            # Fallback to default if no config provided
+            self.db_path = Path.home() / ".seeboard" / "seeboard.db"
+        
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         
         self.connection = None

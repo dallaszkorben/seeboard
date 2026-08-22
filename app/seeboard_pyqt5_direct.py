@@ -44,9 +44,9 @@ from config_loader import ConfigLoader
 _db = None
 global_route_recorder = None
 
-def init_route_recorder():
+def init_route_recorder(config=None):
     global _db, global_route_recorder
-    _db = PathDatabase()
+    _db = PathDatabase(config)
     global_route_recorder = RouteRecorder(_db)
 
 
@@ -755,7 +755,7 @@ class MapTab(QWidget):
         # Initialize route recorder
         from route_database import PathDatabase
         from route_recorder import RouteRecorder
-        self.db = PathDatabase()
+        self.db = PathDatabase(self.config)
         self.recorder = RouteRecorder(self.db)
         
         # Mouse tracking for pan
@@ -2959,14 +2959,16 @@ class SeeBoardApp(QMainWindow):
     def __init__(self):
         super().__init__()
         
-        # Load config
-        config_file = os.path.expanduser("~/Projects/seeboard/see_board.cfg")
+        # Load config from ~/.seeboard/see_board.cfg
+        config_dir = os.path.expanduser("~/.seeboard")
+        os.makedirs(config_dir, exist_ok=True)
+        config_file = os.path.join(config_dir, "see_board.cfg")
         config = ConfigParser()
         config.read(config_file)
         
         # Create centralized config loader
         self.config = ConfigLoader(config)
-        self.config.ensure_sections(['gps', 'coords', 'route_recording', 'camera_rotations', 'cam', 'map'])
+        self.config.ensure_sections(['gps', 'coords', 'route_recording', 'camera_rotations', 'cam', 'map', 'database'])
         
         self.setWindowTitle("seeBoard - GPS & Camera Dashboard")
         self.setGeometry(100, 100, 800, 600)
@@ -3023,9 +3025,10 @@ class SeeBoardApp(QMainWindow):
 
 
 def main():
-    init_route_recorder()
     app = QApplication(sys.argv)
     window = SeeBoardApp()
+    # Initialize route recorder with config after app window is created
+    init_route_recorder(window.config)
     window.show()
     sys.exit(app.exec_())
 
