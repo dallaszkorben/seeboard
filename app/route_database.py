@@ -379,6 +379,49 @@ class PathDatabase:
         cursor.execute("DELETE FROM paths WHERE path_id = ?", (path_id,))
         self.connection.commit()
 
+    def start_new_path(self, path_name: str, color: str) -> Optional[int]:
+        """
+        Start a new path recording with default settings
+        
+        Args:
+            path_name: Name for the path (typically YYYY-mm-ddTHH:MM:SS)
+            color: Color for the path (e.g., 'RED', 'BLUE')
+            
+        Returns:
+            path_id of created path or None if error
+        """
+        try:
+            path_id = self.create_path(
+                name=path_name,
+                color=color,
+                line_width=3,
+                line_style='continuous',
+                sampling_mode='time',
+                sampling_value=15.0
+            )
+            return path_id
+        except Exception as e:
+            print(f"Error starting new path: {e}")
+            return None
+    
+    def add_point_to_path(self, path_id: int, latitude: float, longitude: float) -> Optional[int]:
+        """
+        Add a GPS point to a path
+        
+        Args:
+            path_id: ID of the path
+            latitude: GPS latitude
+            longitude: GPS longitude
+            
+        Returns:
+            point_id or None if error
+        """
+        try:
+            return self.add_point(path_id, latitude, longitude)
+        except Exception as e:
+            print(f"Error adding point to path {path_id}: {e}")
+            return None
+
     def close(self) -> None:
         """Close database connection"""
         if self.connection:
