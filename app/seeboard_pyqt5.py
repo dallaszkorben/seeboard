@@ -541,8 +541,10 @@ class MapCanvas(QGraphicsView):
     Recenter: R key
     """
     
-    # Available zoom levels from MBTiles
-    AVAILABLE_ZOOMS = [8, 10, 12, 14, 16, 17]
+    # Available zoom levels: 8-18 (with overzoom scaling for missing levels)
+    # MBTiles has: 8, 10, 12, 14, 16
+    # Missing levels are interpolated via overzoom scaling
+    AVAILABLE_ZOOMS = [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
     
     def __init__(self, mbtiles_path):
         super().__init__()
@@ -553,6 +555,9 @@ class MapCanvas(QGraphicsView):
         
         # Map renderer
         self.renderer = MapRenderer(mbtiles_path)
+        
+        # Get available zoom levels from MBTiles
+        self.available_zoom_levels_in_db = self.renderer.mbtiles.available_zoom_levels
         
         # Map state
         self.zoom = 12
@@ -651,6 +656,15 @@ class MapCanvas(QGraphicsView):
         self.btn_zoom_minus.clicked.connect(self.zoom_out)
         button_layout.addWidget(self.btn_zoom_minus)
         
+        # Zoom level label
+        self.zoom_level_label = QLabel(f"Z: {self.zoom}")
+        self.zoom_level_label.setAlignment(Qt.AlignCenter)
+        self.zoom_level_label.setMinimumWidth(60)
+        button_layout.addWidget(self.zoom_level_label)
+        
+        # Update label color based on zoom level
+        self._update_zoom_label_color()
+        
         # Add stretch at end
         button_layout.addStretch()
         
@@ -658,6 +672,42 @@ class MapCanvas(QGraphicsView):
         button_widget.move(0, 0)
         button_widget.setMaximumWidth(100)
         button_widget.show()
+    
+    def _update_zoom_label_color(self):
+        """Update zoom label background color: turquoise for real levels, red for scaled."""
+        # Get real zoom levels from MBTiles database
+        real_zoom_levels = self.available_zoom_levels_in_db
+        
+        if self.zoom in real_zoom_levels:
+            # Pastel turquoise for real zoom levels
+            style = """
+                QLabel {
+                    background-color: rgba(102, 205, 170, 220);
+                    color: white;
+                    font-weight: bold;
+                    font-size: 14px;
+                    border: 2px solid white;
+                    border-radius: 8px;
+                    padding: 8px 4px;
+                    text-align: center;
+                }
+            """
+        else:
+            # Pastel red for scaled zoom levels
+            style = """
+                QLabel {
+                    background-color: rgba(255, 160, 160, 220);
+                    color: white;
+                    font-weight: bold;
+                    font-size: 14px;
+                    border: 2px solid white;
+                    border-radius: 8px;
+                    padding: 8px 4px;
+                    text-align: center;
+                }
+            """
+        
+        self.zoom_level_label.setStyleSheet(style)
     
     def render_map(self):
         """Render map and apply pan offset, loading extra tiles for coverage."""
@@ -815,6 +865,11 @@ class MapCanvas(QGraphicsView):
                 # Change zoom
                 self.zoom = zoom
                 
+                # Update zoom level label and color
+                if hasattr(self, 'zoom_level_label'):
+                    self.zoom_level_label.setText(f"Z: {self.zoom}")
+                    self._update_zoom_label_color()
+                
                 # After zoom: adjust center_lat/center_lon so the same point stays at window center
                 if center_lat_before is not None and center_lon_before is not None:
                     self.center_lat = center_lat_before
@@ -837,6 +892,11 @@ class MapCanvas(QGraphicsView):
                 
                 # Change zoom
                 self.zoom = zoom
+                
+                # Update zoom level label and color
+                if hasattr(self, 'zoom_level_label'):
+                    self.zoom_level_label.setText(f"Z: {self.zoom}")
+                    self._update_zoom_label_color()
                 
                 # After zoom: adjust center_lat/center_lon so the same point stays at window center
                 if center_lat_before is not None and center_lon_before is not None:
@@ -927,6 +987,10 @@ class MapCanvas(QGraphicsView):
             for zoom in available_zooms:
                 if zoom > self.zoom:
                     self.zoom = zoom
+                    # Update zoom level label and color
+                    if hasattr(self, 'zoom_level_label'):
+                        self.zoom_level_label.setText(f"Z: {self.zoom}")
+                        self._update_zoom_label_color()
                     self.render_map()
                     break
         else:
@@ -934,10 +998,13 @@ class MapCanvas(QGraphicsView):
             for zoom in reversed(available_zooms):
                 if zoom < self.zoom:
                     self.zoom = zoom
+                    # Update zoom level label and color
+                    if hasattr(self, 'zoom_level_label'):
+                        self.zoom_level_label.setText(f"Z: {self.zoom}")
+                        self._update_zoom_label_color()
                     self.render_map()
                     break
         
-        event.accept()
         event.accept()
     
     def keyPressEvent(self, event):
@@ -1603,9 +1670,29 @@ class MBTilesReader:
     def __init__(self, mbtiles_path):
         self.mbtiles_path = mbtiles_path
         self.conn = sqlite3.connect(mbtiles_path)
+        self.available_zoom_levels = self._get_available_zoom_levels()
+    
+    def _get_available_zoom_levels(self):
+        """Query database to get all available zoom levels."""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT DISTINCT zoom_level FROM tiles ORDER BY zoom_level")
+            rows = cursor.fetchall()
+            return sorted([row[0] for row in rows])
+        except Exception as e:
+            print(f"Error getting zoom levels: {e}")
+            return [8, 10, 12, 14, 16]  # Fallback
+    
+    def is_zoom_level_available(self, zoom):
+        """Check if a specific zoom level exists in the MBTiles."""
+        return zoom in self.available_zoom_levels
     
     def get_tile(self, zoom, tile_x, tile_y):
-        """Read a single tile from MBTiles (with TMS Y conversion)."""
+        """
+        Read a single tile from MBTiles (with TMS Y conversion).
+        Uses overzoom scaling: if requested zoom level doesn't exist,
+        fetch from lower zoom level and scale up 2× per missing level.
+        """
         # Convert XYZ to TMS convention
         tms_y = (2 ** zoom - 1) - tile_y
         
@@ -1624,6 +1711,97 @@ class MBTilesReader:
         except Exception as e:
             pass
         
+        # Tile not found at this zoom level - try overzoom from lower level
+        return self._get_overzoom_tile(zoom, tile_x, tile_y)
+    
+    def _get_overzoom_tile(self, zoom, tile_x, tile_y):
+        """
+        Overzoom: fetch tile from adjacent zoom level and scale.
+        Strategy: prefer scaling DOWN from higher zoom (better quality),
+        only scale UP from lower zoom as fallback.
+        """
+        # First, try to fetch from HIGHER zoom levels (scale down - best quality)
+        for higher_zoom in range(zoom + 1, max(self.conn.execute(
+            "SELECT MAX(zoom_level) FROM tiles"
+        ).fetchone()[0] + 1, zoom + 5)):
+            # Calculate which tile at higher_zoom contains this tile
+            scale_factor = 2 ** (higher_zoom - zoom)
+            higher_tile_x = tile_x * scale_factor
+            higher_tile_y = tile_y * scale_factor
+            
+            # We need to fetch 4 tiles (2x2) from higher zoom and composite them
+            # to get one properly scaled tile
+            try:
+                tiles_found = []
+                for dx in range(2):
+                    for dy in range(2):
+                        check_x = higher_tile_x + dx
+                        check_y = higher_tile_y + dy
+                        
+                        # Convert to TMS
+                        tms_y = (2 ** higher_zoom - 1) - check_y
+                        
+                        cursor = self.conn.cursor()
+                        cursor.execute(
+                            "SELECT tile_data FROM tiles WHERE zoom_level=? AND tile_column=? AND tile_row=?",
+                            (higher_zoom, check_x, tms_y)
+                        )
+                        result = cursor.fetchone()
+                        if result:
+                            tiles_found.append((dx, dy, result[0]))
+                
+                # If we found any tiles at this zoom level, composite them
+                if tiles_found:
+                    # Create a composite image from the tiles
+                    composite = Image.new('RGB', (512, 512))
+                    
+                    for dx, dy, tile_data in tiles_found:
+                        img = Image.open(io.BytesIO(tile_data))
+                        composite.paste(img, (dx * 256, dy * 256))
+                    
+                    # Scale down to single tile size (256x256)
+                    tile_scaled = composite.resize((256, 256), Image.LANCZOS)
+                    return tile_scaled
+            except Exception as e:
+                pass
+        
+        # Fallback: try LOWER zoom levels (scale up - lower quality but better than nothing)
+        for lower_zoom in range(zoom - 1, -1, -1):
+            # Calculate which tile at lower_zoom contains this tile
+            scale_factor = 2 ** (zoom - lower_zoom)
+            lower_tile_x = tile_x // scale_factor
+            lower_tile_y = tile_y // scale_factor
+            
+            # Convert to TMS
+            tms_y = (2 ** lower_zoom - 1) - lower_tile_y
+            
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    "SELECT tile_data FROM tiles WHERE zoom_level=? AND tile_column=? AND tile_row=?",
+                    (lower_zoom, lower_tile_x, tms_y)
+                )
+                result = cursor.fetchone()
+                
+                if result:
+                    tile_data = result[0]
+                    img = Image.open(io.BytesIO(tile_data))
+                    
+                    # Scale up by the factor (2× per missing level)
+                    new_size = (256 * scale_factor, 256 * scale_factor)
+                    img_scaled = img.resize(new_size, Image.LANCZOS)
+                    
+                    # Return only the portion that corresponds to the requested tile
+                    # Calculate which quadrant of the scaled tile we need
+                    offset_x = (tile_x % scale_factor) * 256
+                    offset_y = (tile_y % scale_factor) * 256
+                    
+                    tile_portion = img_scaled.crop((offset_x, offset_y, offset_x + 256, offset_y + 256))
+                    return tile_portion
+            except Exception as e:
+                pass
+        
+        # No tile found at any level
         return None
     
     def close(self):
