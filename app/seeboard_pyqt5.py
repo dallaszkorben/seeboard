@@ -541,6 +541,9 @@ class MapCanvas(QGraphicsView):
     Recenter: R key
     """
     
+    # Available zoom levels from MBTiles
+    AVAILABLE_ZOOMS = [8, 10, 12, 14, 16, 17]
+    
     def __init__(self, mbtiles_path):
         super().__init__()
         
@@ -590,8 +593,71 @@ class MapCanvas(QGraphicsView):
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         
+        # Create overlay zoom buttons
+        self._create_overlay_buttons()
+        
         # Initial render
         self.render_map()
+    
+    def _create_overlay_buttons(self):
+        """Create overlay zoom buttons at top-left corner of map."""
+        # Create a widget to hold the buttons
+        button_widget = QWidget(self)
+        button_layout = QVBoxLayout(button_widget)
+        button_layout.setContentsMargins(10, 10, 10, 10)
+        button_layout.setSpacing(8)
+        
+        # Zoom in button (+)
+        self.btn_zoom_plus = QPushButton("+")
+        self.btn_zoom_plus.setMinimumSize(60, 60)
+        self.btn_zoom_plus.setFont(QFont("Arial", 24, QFont.Bold))
+        self.btn_zoom_plus.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(0, 150, 200, 200);
+                color: white;
+                border: 2px solid white;
+                border-radius: 8px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: rgba(0, 170, 220, 220);
+            }
+            QPushButton:pressed {
+                background-color: rgba(0, 120, 180, 200);
+            }
+        """)
+        self.btn_zoom_plus.clicked.connect(self.zoom_in)
+        button_layout.addWidget(self.btn_zoom_plus)
+        
+        # Zoom out button (-)
+        self.btn_zoom_minus = QPushButton("−")
+        self.btn_zoom_minus.setMinimumSize(60, 60)
+        self.btn_zoom_minus.setFont(QFont("Arial", 32, QFont.Bold))
+        self.btn_zoom_minus.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(0, 150, 200, 200);
+                color: white;
+                border: 2px solid white;
+                border-radius: 8px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: rgba(0, 170, 220, 220);
+            }
+            QPushButton:pressed {
+                background-color: rgba(0, 120, 180, 200);
+            }
+        """)
+        self.btn_zoom_minus.clicked.connect(self.zoom_out)
+        button_layout.addWidget(self.btn_zoom_minus)
+        
+        # Add stretch at end
+        button_layout.addStretch()
+        
+        # Position widget at top-left
+        button_widget.move(0, 0)
+        button_widget.setMaximumWidth(100)
+        button_widget.show()
     
     def render_map(self):
         """Render map and apply pan offset, loading extra tiles for coverage."""
@@ -738,8 +804,7 @@ class MapCanvas(QGraphicsView):
     
     def zoom_in(self):
         """Zoom in to next available zoom level, keeping window center position fixed."""
-        # Available zoom levels in MBTiles: 8, 10, 12, 14, 16, 17
-        available_zooms = [8, 10, 12, 14, 16, 17]
+        available_zooms = self.AVAILABLE_ZOOMS
         
         # Find next higher zoom level
         for zoom in available_zooms:
@@ -762,8 +827,7 @@ class MapCanvas(QGraphicsView):
     
     def zoom_out(self):
         """Zoom out to previous available zoom level, keeping window center position fixed."""
-        # Available zoom levels in MBTiles: 8, 10, 12, 14, 16, 17
-        available_zooms = [8, 10, 12, 14, 16, 17]
+        available_zooms = self.AVAILABLE_ZOOMS
         
         # Find next lower zoom level (in reverse)
         for zoom in reversed(available_zooms):
@@ -856,8 +920,7 @@ class MapCanvas(QGraphicsView):
     
     def wheelEvent(self, event):
         """Handle mouse wheel zoom - FETCHES tiles at available zoom levels only."""
-        # Available zoom levels in MBTiles: 8, 10, 12, 14, 16, 17
-        available_zooms = [8, 10, 12, 14, 16, 17]
+        available_zooms = self.AVAILABLE_ZOOMS
         
         if event.angleDelta().y() > 0:
             # Zoom in - find next higher available zoom level
@@ -1812,8 +1875,24 @@ class MapRenderer:
             # Inner white line
             draw.polygon(drop_points, outline='#FFFFFF', width=1)
             
-            # Label positioned above the droplet
-            draw.text((px_int - 15, py_int - 40), "GPS", fill='#FFFFFF')
+            # Label positioned INSIDE the droplet TOP, centered horizontally
+            # Calculate text dimensions for proper centering
+            try:
+                text_bbox = draw.textbbox((0, 0), "GPS", font=None)
+                text_width = text_bbox[2] - text_bbox[0]
+                text_height = text_bbox[3] - text_bbox[1]
+            except:
+                text_width = len("GPS") * 4
+                text_height = 8
+            
+            # Position in TOP of droplet (above center, in the round bulbous part)
+            # Top of droplet is at: py_int - int(16 * scale) = py_int - 24
+            # Put text roughly 1/3 down from top
+            label_x = int(px_int - text_width / 2)
+            label_y = int(py_int - 16 * scale - 5)  # Top area of droplet
+            
+            # Draw text in white
+            draw.text((label_x, label_y), "GPS", fill='#FFFFFF')
 
 
 # ============================================================================
@@ -2040,23 +2119,10 @@ class MapTab(QWidget):
             self.canvas.parent_map_tab = self  # Reference back to MapTab for recording state
             main_layout.addWidget(self.canvas, 1)
             
-            # Control buttons - Top row: zoom, pan, recenter, mode toggle
+            # Control buttons - Top row: pan, recenter, mode toggle
             top_button_layout = QHBoxLayout()
             top_button_layout.setContentsMargins(5, 5, 5, 5)
             top_button_layout.setSpacing(3)
-            
-            # Zoom buttons - wider for touch
-            btn_zoom_in = QPushButton("Zoom +")
-            btn_zoom_in.setMinimumWidth(80)
-            btn_zoom_in.setMinimumHeight(45)
-            btn_zoom_in.clicked.connect(self.canvas.zoom_in)
-            top_button_layout.addWidget(btn_zoom_in)
-            
-            btn_zoom_out = QPushButton("Zoom -")
-            btn_zoom_out.setMinimumWidth(80)
-            btn_zoom_out.setMinimumHeight(45)
-            btn_zoom_out.clicked.connect(self.canvas.zoom_out)
-            top_button_layout.addWidget(btn_zoom_out)
             
             # Pan buttons - wider for touch
             btn_pan_up = QPushButton("Pan ↑")
@@ -2309,6 +2375,20 @@ class MapTab(QWidget):
                     self.current_recording_points.append((self.current_lat, self.current_lon))
                     print(f"[MAP] Recorded first position: ({self.current_lat}, {self.current_lon})")
                 
+                # AUTO-SWITCH TO FOLLOW MODE for recording
+                self.map_mode = "FOLLOW"
+                self.mode_toggle_btn.setText(f"Mode: {self.map_mode}")
+                self.status_label.setText(f"Mode: {self.map_mode}")
+                self.status_label.setStyleSheet(
+                    "background-color: rgba(255, 0, 0, 200); "
+                    "color: white; "
+                    "padding: 8px 12px; "
+                    "font-weight: bold; "
+                    "border-radius: 4px; "
+                    "min-width: 100px; "
+                    "text-align: center;"
+                )
+                
                 # Update UI - swap button states
                 self.btn_record.setEnabled(False)
                 self.btn_stop.setEnabled(True)
@@ -2325,6 +2405,7 @@ class MapTab(QWidget):
                 
                 print(f"[MAP] Started recording: Path {path_id} '{path_name}' ({line_color})")
                 print(f"[MAP] Time-based sampling: every {time_interval}s")
+                print(f"[MAP] Auto-switched to FOLLOW mode")
                 
         except Exception as e:
             print(f"[MAP] Error starting recording: {e}")
@@ -2347,15 +2428,34 @@ class MapTab(QWidget):
             
             self.is_recording = False
             
+            # Switch back to FREE mode
+            self.map_mode = "FREE"
+            self.mode_toggle_btn.setText(f"Mode: {self.map_mode}")
+            self.status_label.setText(f"Mode: {self.map_mode}")
+            self.status_label.setStyleSheet(
+                "background-color: rgba(0, 0, 0, 200); "
+                "color: white; "
+                "padding: 8px 12px; "
+                "font-weight: bold; "
+                "border-radius: 4px; "
+                "min-width: 100px; "
+                "text-align: center;"
+            )
+            
             # Update UI - swap button states
             self.btn_record.setEnabled(True)
             self.btn_stop.setEnabled(False)
             
             print(f"[MAP] Stopped recording: Path {path_id}")
+            print(f"[MAP] Switched back to FREE mode")
             
             self.current_recording_path_id = None
             self.current_recording_color = None
             self.current_recording_points = []
+            
+            # Re-render map to hide recording overlay
+            if hasattr(self, 'canvas'):
+                self.canvas.render_map()
             
         except Exception as e:
             print(f"[MAP] Error stopping recording: {e}")
@@ -2379,9 +2479,9 @@ class MapTab(QWidget):
                 # Store point locally for drawing
                 self.current_recording_points.append((self.current_lat, self.current_lon))
                 
-                # Re-render map to show new point and line
+                # Recenter on new recorded position
                 if hasattr(self, 'canvas'):
-                    self.canvas.render_map()
+                    self.canvas.recenter_on_gps()
                 
         except Exception as e:
             print(f"[MAP] Error recording GPS point: {e}")
