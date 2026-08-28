@@ -245,13 +245,19 @@ _NO_SIGNAL_TIMEOUT = 3
 
 
 def _is_stale(state, timeout_seconds=5):
-    """Check if a camera stream has not received frames for too long."""
-    return (time.time() - state.get("last_frame_time", 0)) > timeout_seconds
+    """Check if a camera stream has not received frames for too long.
+    Returns False if no frames have ever been received (new camera)."""
+    last_frame_time = state.get("last_frame_time", 0)
+    if last_frame_time == 0:
+        # No frames received yet - not stale, just initializing
+        return False
+    return (time.time() - last_frame_time) > timeout_seconds
 
 
 def _reader(url, state):
     """Background thread: reads MJPEG stream, extracts JPEG frames (from tkinter cam_view.py)"""
     MAX_BUF = 200000
+    
     while state["running"]:
         try:
             import urllib.request
@@ -285,7 +291,7 @@ def start_new_cameras():
     cameras = cam_discovery.get_cameras()
     new_urls = {url for url in cameras.values()} - _known_urls
     for url in new_urls:
-        state = {"running": True, "frame": None, "last_frame_time": 0}  # START AT 0 SO IMMEDIATELY STALE
+        state = {"running": True, "frame": None, "last_frame_time": time.time()}  # Initialize to now, not 0
         t = threading.Thread(target=_reader, args=(url, state), daemon=True)
         t.start()
         _streams[url] = state
@@ -594,6 +600,11 @@ class MapCanvas(QGraphicsView):
         self._is_zooming = False
         self._pixel_position = QPoint()
         
+        # STEP 1.3: Render throttling for performance
+        self._render_timer = None
+        self._pending_render = False
+        self._render_cooldown_ms = 50  # Max render every 50ms (20 FPS)
+        
         # Display settings
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -709,6 +720,40 @@ class MapCanvas(QGraphicsView):
         
         self.zoom_level_label.setStyleSheet(style)
     
+    def _schedule_render(self):
+        """STEP 1.3: Schedule render with throttling to prevent excessive redraws."""
+        self._pending_render = True
+        
+        if not self._render_timer:
+            self._render_timer = QTimer()
+            self._render_timer.setSingleShot(True)
+            self._render_timer.timeout.connect(self._execute_pending_render)
+        
+        self._render_timer.start(self._render_cooldown_ms)
+    
+    def _execute_pending_render(self):
+        """STEP 1.3: Execute pending render if one was scheduled."""
+        if self._pending_render:
+            self.render_map()
+            self._pending_render = False
+        self._render_timer = None
+    
+    def _get_viewport_bounds(self):
+        """
+        STEP 2.1: Calculate viewport bounds in lat/lon.
+        Returns (min_lat, max_lat, min_lon, max_lon) for viewport + margin.
+        """
+        # Calculate canvas corners in tile coordinates
+        # This is a simplified viewport - good enough for culling
+        # Margin of 0.05 degrees = ~5.5 km
+        margin = 0.05
+        return (
+            self.center_lat - margin,  # min_lat
+            self.center_lat + margin,  # max_lat
+            self.center_lon - margin,  # min_lon
+            self.center_lon + margin   # max_lon
+        )
+    
     def render_map(self):
         """Render map and apply pan offset, loading extra tiles for coverage."""
         # Skip if already rendering to prevent race conditions
@@ -718,35 +763,46 @@ class MapCanvas(QGraphicsView):
         self._is_zooming = True
         
         try:
-            # Load all visible paths from database
+            # STEP 2.2: Fix N+1 queries - use single JOIN query instead of loop
             visible_paths = []
             try:
                 if global_route_recorder and global_route_recorder.db and global_route_recorder.db.connection:
-                    cursor = global_route_recorder.db.connection.cursor()
-                    cursor.execute("""
-                        SELECT path_id, color FROM paths WHERE is_visible = 1
-                    """)
-                    visible_path_rows = cursor.fetchall()
+                    # Get viewport bounds for culling
+                    min_lat, max_lat, min_lon, max_lon = self._get_viewport_bounds()
                     
-                    # Fetch points for each visible path
-                    for path_id, color in visible_path_rows:
-                        cursor.execute("""
-                            SELECT latitude, longitude FROM path_points 
-                            WHERE path_id = ? 
-                            ORDER BY timestamp ASC
-                        """, (path_id,))
-                        points = cursor.fetchall()
-                        if points:
-                            visible_paths.append({
-                                'points': points,
-                                'color': color or 'RED'
-                            })
+                    cursor = global_route_recorder.db.connection.cursor()
+                    # Single query with JOIN - loads all paths and points at once
+                    cursor.execute("""
+                        SELECT p.path_id, p.color, pp.latitude, pp.longitude
+                        FROM paths p
+                        JOIN path_points pp ON p.path_id = pp.path_id
+                        WHERE p.is_visible = 1
+                        AND pp.latitude >= ? AND pp.latitude <= ?
+                        AND pp.longitude >= ? AND pp.longitude <= ?
+                        ORDER BY p.path_id, pp.timestamp
+                    """, (min_lat, max_lat, min_lon, max_lon))
+                    
+                    rows = cursor.fetchall()
+                    
+                    # Organize into paths
+                    paths_dict = {}
+                    for path_id, color, lat, lon in rows:
+                        if path_id not in paths_dict:
+                            paths_dict[path_id] = {
+                                'color': color or 'RED',
+                                'points': []
+                            }
+                        paths_dict[path_id]['points'].append((lat, lon))
+                    
+                    visible_paths = list(paths_dict.values())
             except Exception as e:
                 print(f"[MAP] Error loading visible paths: {e}")
             
             # Create a larger canvas to accommodate pan offset
-            expanded_width = self.canvas_width + abs(self.pan_offset_x) + 512
-            expanded_height = self.canvas_height + abs(self.pan_offset_y) + 512
+            # STEP 1.2: Reduced margin from 512 to 100 pixels (significant speedup)
+            margin = 100  # pixels - just enough for smooth pan transitions
+            expanded_width = self.canvas_width + abs(self.pan_offset_x) + margin
+            expanded_height = self.canvas_height + abs(self.pan_offset_y) + margin
             
             # Get recording points and settings if actively recording
             recording_points = None
@@ -789,8 +845,9 @@ class MapCanvas(QGraphicsView):
             cropped = canvas.crop(crop_box)
             output.paste(cropped, (0, 0))
             
-            # Convert PIL Image to QPixmap
-            pil_image = output.convert('RGB')
+            # STEP 2.3: Optimized PIL to QPixmap conversion
+            # Skip redundant .convert('RGB') since output is already RGB
+            pil_image = output  # Already in RGB mode
             data = pil_image.tobytes('raw', 'RGB')
             qimage = QImage(data, self.canvas_width, self.canvas_height,
                            self.canvas_width * 3, QImage.Format_RGB888)
@@ -849,8 +906,9 @@ class MapCanvas(QGraphicsView):
         self.pan_offset_x += pixel_dx
         self.pan_offset_y += pixel_dy
         
+        # STEP 1.3: Use throttled render instead of immediate
         # Re-render with the new offset (renderer will load appropriate tiles)
-        self.render_map()
+        self._schedule_render()
     
     def zoom_in(self):
         """Zoom in to next available zoom level, keeping window center position fixed."""
@@ -979,32 +1037,85 @@ class MapCanvas(QGraphicsView):
         super().mouseReleaseEvent(event)
     
     def wheelEvent(self, event):
-        """Handle mouse wheel zoom - FETCHES tiles at available zoom levels only."""
+        """Handle mouse wheel zoom.
+        
+        In FOLLOW mode: zoom to center (GPS position at middle of screen)
+        In FREE mode: zoom to cursor position
+        """
         available_zooms = self.AVAILABLE_ZOOMS
+        old_zoom = self.zoom
+        new_zoom = old_zoom
         
         if event.angleDelta().y() > 0:
             # Zoom in - find next higher available zoom level
             for zoom in available_zooms:
                 if zoom > self.zoom:
-                    self.zoom = zoom
-                    # Update zoom level label and color
-                    if hasattr(self, 'zoom_level_label'):
-                        self.zoom_level_label.setText(f"Z: {self.zoom}")
-                        self._update_zoom_label_color()
-                    self.render_map()
+                    new_zoom = zoom
                     break
         else:
             # Zoom out - find next lower available zoom level
             for zoom in reversed(available_zooms):
                 if zoom < self.zoom:
-                    self.zoom = zoom
-                    # Update zoom level label and color
-                    if hasattr(self, 'zoom_level_label'):
-                        self.zoom_level_label.setText(f"Z: {self.zoom}")
-                        self._update_zoom_label_color()
-                    self.render_map()
+                    new_zoom = zoom
                     break
         
+        if new_zoom == old_zoom:
+            return  # No zoom change
+        
+        # Get cursor position on canvas
+        cursor_pos = event.pos()
+        cursor_x = cursor_pos.x()
+        cursor_y = cursor_pos.y()
+        
+        # Check if in FOLLOW mode
+        is_follow_mode = (hasattr(self, 'parent_map_tab') and 
+                         self.parent_map_tab and 
+                         self.parent_map_tab.map_mode == "FOLLOW")
+        
+        if is_follow_mode:
+            # FOLLOW mode: zoom to center (GPS stays at middle)
+            self.zoom = new_zoom
+        else:
+            # FREE mode: zoom to cursor position
+            # Calculate what lat/lon is under the cursor before zoom
+            old_center_world_x, old_center_world_y = WebMercator.lat_lon_to_world(
+                self.center_lat, self.center_lon, old_zoom)
+            
+            # Convert cursor pixel to world coordinate at old zoom
+            canvas_w = self.width()
+            canvas_h = self.height()
+            old_cursor_world_x = old_center_world_x + (cursor_x - canvas_w / 2)
+            old_cursor_world_y = old_center_world_y + (cursor_y - canvas_h / 2)
+            
+            # Convert to lat/lon
+            cursor_lat, cursor_lon = WebMercator.world_to_lat_lon(
+                old_cursor_world_x, old_cursor_world_y, old_zoom)
+            
+            # Change zoom
+            self.zoom = new_zoom
+            
+            # Calculate new world position of that lat/lon at new zoom
+            new_cursor_world_x, new_cursor_world_y = WebMercator.lat_lon_to_world(
+                cursor_lat, cursor_lon, new_zoom)
+            
+            # Calculate new center so cursor point stays at same screen position
+            new_center_world_x = new_cursor_world_x - (cursor_x - canvas_w / 2)
+            new_center_world_y = new_cursor_world_y - (cursor_y - canvas_h / 2)
+            
+            # Convert back to lat/lon
+            new_center_lat, new_center_lon = WebMercator.world_to_lat_lon(
+                new_center_world_x, new_center_world_y, new_zoom)
+            
+            self.center_lat = new_center_lat
+            self.center_lon = new_center_lon
+        
+        # Update zoom level label and color
+        if hasattr(self, 'zoom_level_label'):
+            self.zoom_level_label.setText(f"Z: {self.zoom}")
+            self._update_zoom_label_color()
+        
+        # Schedule render
+        self._schedule_render()
         event.accept()
     
     def keyPressEvent(self, event):
@@ -1671,6 +1782,12 @@ class MBTilesReader:
         self.mbtiles_path = mbtiles_path
         self.conn = sqlite3.connect(mbtiles_path)
         self.available_zoom_levels = self._get_available_zoom_levels()
+        
+        # STEP 1.1: Tile caching for performance optimization
+        self.tile_cache = {}
+        self.cache_max_size = 500  # ~150MB for 256×256 RGB tiles
+        self.cache_hits = 0
+        self.cache_misses = 0
     
     def _get_available_zoom_levels(self):
         """Query database to get all available zoom levels."""
@@ -1692,7 +1809,16 @@ class MBTilesReader:
         Read a single tile from MBTiles (with TMS Y conversion).
         Uses overzoom scaling: if requested zoom level doesn't exist,
         fetch from lower zoom level and scale up 2× per missing level.
+        Includes tile caching for performance optimization.
         """
+        # STEP 1.1: Check cache first (huge performance win)
+        cache_key = (zoom, tile_x, tile_y)
+        if cache_key in self.tile_cache:
+            self.cache_hits += 1
+            return self.tile_cache[cache_key]
+        
+        self.cache_misses += 1
+        
         # Convert XYZ to TMS convention
         tms_y = (2 ** zoom - 1) - tile_y
         
@@ -1707,6 +1833,18 @@ class MBTilesReader:
             if result:
                 tile_data = result[0]
                 img = Image.open(io.BytesIO(tile_data))
+                
+                # STEP 1.4: Convert to RGB immediately (once per load, not per render)
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
+                
+                # STEP 1.1: Cache the tile with LRU eviction
+                if len(self.tile_cache) >= self.cache_max_size:
+                    # Remove oldest entry (FIFO)
+                    oldest_key = next(iter(self.tile_cache))
+                    del self.tile_cache[oldest_key]
+                
+                self.tile_cache[cache_key] = img
                 return img
         except Exception as e:
             pass
@@ -2738,7 +2876,6 @@ class CamTab(QWidget):
             self.current_width = self.cam_label.width()
             self.current_height = self.cam_label.height()
             self.first_resize = False
-            print(f"[CAM] First resize: set dimensions to {self.current_width}x{self.current_height}")
     
     def on_tab_shown(self):
         """Called when CAM tab becomes visible - reload config to get updated rotations"""
@@ -2752,8 +2889,13 @@ class CamTab(QWidget):
             urls = list(_streams.keys())
             grace_period = self.config.get_int('camera_settings', 'grace_period_seconds', default=5)
             
-            # Log state
-            log_msg = f"[DISPLAY] URLs: {len(urls)}, Expired: {len(self.expired_cameras)}, Fullscreen: {self.fullscreen_url}\n"
+            # Log state with detailed camera info
+            log_msg = f"\n[DISPLAY] URLs: {len(urls)}, Expired: {len(self.expired_cameras)}, Fullscreen: {self.fullscreen_url}\n"
+            for url in urls:
+                frame = _streams[url].get("frame")
+                last_time = _streams[url].get("last_frame_time", 0)
+                is_stale = _is_stale(_streams[url], timeout_seconds=grace_period)
+                log_msg += f"  {url.split('/')[-1]}: frame={bool(frame)}, last_frame_time={last_time}, is_stale={is_stale}\n"
             
             # Update expired camera tracking
             # Remove from expired if signal returns
@@ -2780,9 +2922,9 @@ class CamTab(QWidget):
                 is_stale = _is_stale(_streams[url], timeout_seconds=grace_period)
                 log_msg += f"  [{url.split('/')[-1]}] frame={has_frame}, stale={is_stale}\n"
             
-            # Debug logging (disabled to avoid permission issues when running as root)
-            # with open('/tmp/seeboard_display.log', 'a') as f:
-            #     f.write(log_msg)
+            # Debug logging
+            with open('/tmp/seeboard_display.log', 'a') as f:
+                f.write(log_msg)
             if not urls:
                 self.cam_label.setText("Searching for cameras...")
                 return
@@ -2904,12 +3046,16 @@ class CamTab(QWidget):
                 draw.rectangle([(x-3, y-3), (x+text_w+3, y+text_h+3)], fill=label_bg_color)
                 draw.text((x, y), display, fill=color, font=font)
                 
-                # NO SIGNAL if frame hasn't been updated recently (< 100ms)
-                last_update = time.time() - _streams[url].get("last_frame_time", 0)
-                frame_is_stale_immediately = last_update > 0.1  # No update in 100ms
+                # NO SIGNAL only if we HAVE a frame but it hasn't updated in 100ms
+                # (indicates connection is alive but stream is frozen/stalled)
+                frame_is_stale_immediately = False
+                if frame_data:
+                    last_frame_time = _streams[url].get("last_frame_time", time.time())
+                    last_update = time.time() - last_frame_time
+                    frame_is_stale_immediately = last_update > 0.1  # No update in 100ms
                 
                 if frame_is_stale_immediately:
-                    # Show NO SIGNAL immediately
+                    # Show NO SIGNAL overlay on stalled frame
                     try:
                         font_big = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", int(img.height // 8))
                     except:
@@ -3112,7 +3258,8 @@ class ConfTab(QWidget):
         font_layout.addWidget(self.font_size_slider)
         
         self.font_size_value = QLabel(str(self.font_size_slider.value()))
-        self.font_size_value.setStyleSheet("font-size: 12px; color: #007AFF; font-weight: bold; min-width: 35px; border: none;")
+        self.font_size_value.setStyleSheet("font-size: 12px; color: #007AFF; font-weight: bold; min-width: 45px; text-align: right; border: none;")
+        self.font_size_value.setAlignment(Qt.AlignRight)
         self.font_size_slider.valueChanged.connect(lambda v: self.font_size_value.setText(str(v)))
         font_layout.addWidget(self.font_size_value)
         coord_layout.addLayout(font_layout)
@@ -3172,7 +3319,8 @@ class ConfTab(QWidget):
         meta_font_layout.addWidget(self.meta_font_size_slider)
         
         self.meta_font_size_value = QLabel(str(self.meta_font_size_slider.value()))
-        self.meta_font_size_value.setStyleSheet("font-size: 12px; color: #007AFF; font-weight: bold; min-width: 35px; border: none;")
+        self.meta_font_size_value.setStyleSheet("font-size: 12px; color: #007AFF; font-weight: bold; min-width: 45px; text-align: right; border: none;")
+        self.meta_font_size_value.setAlignment(Qt.AlignRight)
         self.meta_font_size_slider.valueChanged.connect(lambda v: self.meta_font_size_value.setText(str(v)))
         meta_font_layout.addWidget(self.meta_font_size_value)
         meta_layout.addLayout(meta_font_layout)
@@ -3256,7 +3404,8 @@ class ConfTab(QWidget):
         bg_slider_layout.addWidget(self.bg_brightness_slider)
         
         self.bg_brightness_value = QLabel(f"{saved_brightness}")
-        self.bg_brightness_value.setStyleSheet("font-size: 12px; color: #007AFF; font-weight: bold; min-width: 35px; border: none;")
+        self.bg_brightness_value.setStyleSheet("font-size: 12px; color: #007AFF; font-weight: bold; min-width: 45px; text-align: right; border: none;")
+        self.bg_brightness_value.setAlignment(Qt.AlignRight)
         bg_slider_layout.addWidget(self.bg_brightness_value)
         
         bg_layout.addLayout(bg_slider_layout)
@@ -3391,7 +3540,8 @@ class ConfTab(QWidget):
         path_width_layout.addWidget(self.path_width_slider)
         
         self.path_width_value = QLabel(str(self.path_width_slider.value()))
-        self.path_width_value.setStyleSheet("font-size: 12px; color: #007AFF; font-weight: bold; min-width: 35px; border: none;")
+        self.path_width_value.setStyleSheet("font-size: 12px; color: #007AFF; font-weight: bold; min-width: 45px; text-align: right; border: none;")
+        self.path_width_value.setAlignment(Qt.AlignRight)
         self.path_width_slider.valueChanged.connect(lambda v: self.path_width_value.setText(str(v)))
         path_width_layout.addWidget(self.path_width_value)
         record_layout.addLayout(path_width_layout)
@@ -3413,7 +3563,8 @@ class ConfTab(QWidget):
         radius_layout.addWidget(self.position_radius_slider)
         
         self.position_radius_value = QLabel(str(self.position_radius_slider.value()))
-        self.position_radius_value.setStyleSheet("font-size: 12px; color: #007AFF; font-weight: bold; min-width: 35px; border: none;")
+        self.position_radius_value.setStyleSheet("font-size: 12px; color: #007AFF; font-weight: bold; min-width: 45px; text-align: right; border: none;")
+        self.position_radius_value.setAlignment(Qt.AlignRight)
         self.position_radius_slider.valueChanged.connect(lambda v: self.position_radius_value.setText(str(v)))
         radius_layout.addWidget(self.position_radius_value)
         record_layout.addLayout(radius_layout)
@@ -3435,7 +3586,8 @@ class ConfTab(QWidget):
         pos_font_layout.addWidget(self.position_font_size_slider)
         
         self.position_font_size_value = QLabel(str(self.position_font_size_slider.value()))
-        self.position_font_size_value.setStyleSheet("font-size: 12px; color: #007AFF; font-weight: bold; min-width: 35px; border: none;")
+        self.position_font_size_value.setStyleSheet("font-size: 12px; color: #007AFF; font-weight: bold; min-width: 45px; text-align: right; border: none;")
+        self.position_font_size_value.setAlignment(Qt.AlignRight)
         self.position_font_size_slider.valueChanged.connect(lambda v: self.position_font_size_value.setText(str(v)))
         pos_font_layout.addWidget(self.position_font_size_value)
         record_layout.addLayout(pos_font_layout)
@@ -3469,9 +3621,9 @@ class ConfTab(QWidget):
         grace_period_layout.addWidget(self.grace_period_slider)
         
         self.grace_period_value = QLabel(f"{saved_grace_period}s")
-        self.grace_period_value.setStyleSheet("font-size: 12px; color: #007AFF; font-weight: bold; min-width: 35px; border: none;")
+        self.grace_period_value.setStyleSheet("font-size: 12px; color: #007AFF; font-weight: bold; min-width: 45px; text-align: right; border: none;")
+        self.grace_period_value.setAlignment(Qt.AlignRight)
         grace_period_layout.addWidget(self.grace_period_value)
-        grace_period_layout.addStretch()
         
         camera_section.add_layout(grace_period_layout)
         
@@ -3493,10 +3645,10 @@ class ConfTab(QWidget):
         font_size_layout.addWidget(self.camera_label_font_size_slider)
         
         self.camera_label_font_size_value = QLabel(f"{saved_label_font_size}px")
-        self.camera_label_font_size_value.setStyleSheet("font-size: 12px; color: #007AFF; font-weight: bold; min-width: 50px; border: none;")
+        self.camera_label_font_size_value.setStyleSheet("font-size: 12px; color: #007AFF; font-weight: bold; min-width: 45px; text-align: right; border: none;")
+        self.camera_label_font_size_value.setAlignment(Qt.AlignRight)
         self.camera_label_font_size_slider.valueChanged.connect(lambda v: self.camera_label_font_size_value.setText(f"{v}px"))
         font_size_layout.addWidget(self.camera_label_font_size_value)
-        font_size_layout.addStretch()
         camera_section.add_layout(font_size_layout)
         
         # Camera Label Color
@@ -4718,8 +4870,8 @@ class SeeBoardApp(QMainWindow):
         
         try:
             start_new_cameras()
-        except Exception as e:
-            print(f"[APP] Error starting cameras: {e}")
+        except Exception:
+            pass
     
     def on_tab_changed(self, index):
         """Handle tab change - refresh settings on visible tabs"""

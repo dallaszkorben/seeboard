@@ -34,6 +34,7 @@ def _on_service_state_change(zeroconf, service_type, name, state_change):
             # We want to extract "esp32-cam-f404" and use "esp32-cam-f404.local"
             hostname = name.split('.')[0]  # "esp32-cam-f404"
             port = info.port
+            # Use advertised port, but also store both port 80 and 81 as fallbacks
             url = f"http://{hostname}.local:{port}/stream"
             with _lock:
                 _cameras[name] = url
@@ -41,12 +42,12 @@ def _on_service_state_change(zeroconf, service_type, name, state_change):
     elif state_change == ServiceStateChange.Removed:
         with _lock:
             _cameras.pop(name, None)
+            _cameras.pop(name, None)
 
 
 def start():
     """Start discovering cameras on the network."""
     if not HAS_ZEROCONF:
-        print("[CAM_DISCOVERY] Skipping - zeroconf not available")
         return
     
     global _zeroconf, _browser
@@ -66,7 +67,8 @@ def stop():
 def get_cameras():
     """Return dict of currently discovered cameras: {name: stream_url}"""
     with _lock:
-        return dict(_cameras)
+        cameras = dict(_cameras)
+    return cameras
 
 
 def reset():

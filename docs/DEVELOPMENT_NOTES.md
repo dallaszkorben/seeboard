@@ -120,7 +120,109 @@ class SeeBoardApp(QMainWindow):
 
 ---
 
-### 4. Collapsible Section Structure (GPS = Parent Section)
+### 4. Overzoom Tile Scaling - Smooth Zooming with Discrete Tile Levels
+
+**Problem:** MBTiles files often contain only selected zoom levels to save space. The seeBoard MBTiles has tiles only at zoom 8, 10, 12, 14, 16 (every other level). Direct mapping would force users to zoom in 4× jumps, creating a jerky experience.
+
+**Solution:** Implement dynamic overzoom scaling that:
+1. Fetches tiles from **adjacent zoom levels** when the requested level doesn't exist
+2. Scales tiles **down** (downsampling) when possible for better quality
+3. Falls back to scaling **up** (upsampling) when higher levels don't exist
+4. Dynamically determines real vs. scaled levels from the MBTiles database (no hardcoding)
+
+**Architecture:**
+
+```python
+# MBTilesReader queries database for available zoom levels on init
+class MBTilesReader:
+    def __init__(self, mbtiles_path):
+        self.conn = sqlite3.connect(mbtiles_path)
+        self.available_zoom_levels = self._get_available_zoom_levels()
+    
+    def _get_available_zoom_levels(self):
+        """Query SELECT DISTINCT zoom_level FROM tiles"""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT DISTINCT zoom_level FROM tiles ORDER BY zoom_level")
+        return sorted([row[0] for row in cursor.fetchall()])
+    
+    def is_zoom_level_available(self, zoom):
+        """Check if zoom level exists in database"""
+        return zoom in self.available_zoom_levels
+```
+
+**Overzoom Logic (prefer downsampling):**
+
+```python
+def _get_overzoom_tile(self, zoom, tile_x, tile_y):
+    """
+    Strategy: Prefer scaling DOWN from higher zoom for better quality.
+    Only scale UP from lower zoom if higher levels don't exist.
+    """
+    # FIRST: Try higher zoom levels (scale DOWN - best quality)
+    for higher_zoom in range(zoom + 1, 23):
+        if higher_zoom in self.available_zoom_levels:
+            # Fetch 2×2 grid from higher zoom
+            # Composite into single tile
+            # Scale DOWN to 256×256
+            return downsampled_tile
+    
+    # FALLBACK: Try lower zoom levels (scale UP - lower quality)
+    for lower_zoom in range(zoom - 1, -1, -1):
+        if lower_zoom in self.available_zoom_levels:
+            # Fetch single tile from lower zoom
+            # Scale UP by 2× per missing level
+            return upsampled_tile
+    
+    return None  # No tile at any level
+```
+
+**Color Coding in UI:**
+
+Zoom level indicator shows two colors:
+- **Pastel Turquoise** - Real zoom level (tile exists in MBTiles)
+- **Pastel Red** - Scaled zoom level (interpolated from adjacent level)
+
+This visual feedback helps users understand map quality at a glance:
+```python
+def _update_zoom_label_color(self):
+    real_zoom_levels = self.available_zoom_levels_in_db
+    
+    if self.zoom in real_zoom_levels:
+        # Turquoise: real tile
+        self.zoom_level_label.setStyleSheet("background-color: rgba(102, 205, 170, 220);...")
+    else:
+        # Red: scaled tile
+        self.zoom_level_label.setStyleSheet("background-color: rgba(255, 160, 160, 220);...")
+```
+
+**Standard Web Mercator Zoom Levels:**
+
+Zoom levels 0-22 are standard across all web mapping systems (Google, OSM, etc.):
+- Zoom 0 = 1 tile (entire world)
+- Zoom 1 = 4 tiles
+- Zoom 8 = 65,536 tiles
+- Each level doubles resolution in both X and Y
+
+**Your MBTiles Specifics:**
+- Available levels: 8, 10, 12, 14, 16 (discrete subset)
+- Synthetic levels: 9, 11, 13, 15, 17, 18 (created via overzoom)
+- User zooms 1-level increments seamlessly
+
+**Benefits:**
+- ✅ Smooth zooming (1-level steps instead of 4×)
+- ✅ Adaptive to MBTiles changes (no hardcoding)
+- ✅ Better quality (prefers downsampling)
+- ✅ Visual feedback (color coding)
+- ✅ Future-proof (works with any MBTiles)
+
+**PIL Compatibility Note:**
+- Use `Image.LANCZOS` (works PIL 9.4+)
+- NOT `Image.Resampling.LANCZOS` (only PIL 10.0+)
+- Raspberry Pi has PIL 9.4.0, so older syntax needed
+
+---
+
+### 5. Collapsible Section Structure (GPS = Parent Section)
 
 **Design Decision:** GPS section contains all GPS-related subsections
 - GPS (collapsible parent)
@@ -137,7 +239,7 @@ class SeeBoardApp(QMainWindow):
 
 ---
 
-### 5. CollapsibleSection Class Design
+### 6. CollapsibleSection Class Design
 
 **Requirements:**
 - Entire header clickable (not just icon) - important for boat use where finger coordination is difficult
@@ -153,7 +255,7 @@ class SeeBoardApp(QMainWindow):
 
 ---
 
-### 6. PyQt5 Layout Rebuilding - Element Ordering is Critical
+### 7. PyQt5 Layout Rebuilding - Element Ordering is Critical
 
 **Problem:** When you rebuild a collapsible section or layout dynamically (e.g., in `on_tab_shown()`), elements get deleted via `takeAt()` and must be re-added. If you forget permanent elements during rebuild, they disappear (not "covered").
 
