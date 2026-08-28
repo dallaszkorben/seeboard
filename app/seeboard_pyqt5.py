@@ -594,13 +594,13 @@ class MapCanvas(QGraphicsView):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         
         # Create overlay zoom buttons
-        self._create_overlay_buttons()
+        self._create_zoom_overlay_buttons()
         
         # Initial render
         self.render_map()
     
-    def _create_overlay_buttons(self):
-        """Create overlay zoom buttons at top-left corner of map."""
+    def _create_zoom_overlay_buttons(self):
+        """Create overlay zoom +/- buttons at top-left corner of map."""
         # Create a widget to hold the buttons
         button_widget = QWidget(self)
         button_layout = QVBoxLayout(button_widget)
